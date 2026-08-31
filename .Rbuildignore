@@ -7,3 +7,4 @@
 ^GITHUB-SETUP[.]md$
 ^_pkgdown[.]yml$
 ^[.]github$
+^\.github$
