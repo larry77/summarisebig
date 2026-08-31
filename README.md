@@ -165,21 +165,21 @@ regression_mr <- summarise_big(
   .strategy = "map_reduce",
   .map_reduce = list(
     n = ~ dplyr::n(),
-    sx = ~ sum(x),
-    sy = ~ sum(y),
-    sxx = ~ sum(x * x),
-    syy = ~ sum(y * y),
-    sxy = ~ sum(x * y)
+    sum_x = ~ sum(x),
+    sum_y = ~ sum(y),
+    sum_x2 = ~ sum(x * x),
+    sum_y2 = ~ sum(y * y),
+    sum_xy = ~ sum(x * y)
   ),
   .finalize = function(state) {
     state |>
       mutate(
-        Sxx = sxx - sx^2 / n,
-        Syy = syy - sy^2 / n,
-        Sxy = sxy - sx * sy / n,
-        slope = Sxy / Sxx,
-        residual_ss = Syy - slope * Sxy,
-        slope_se = sqrt((residual_ss / (n - 2)) / Sxx),
+        centered_xx = sum_x2 - sum_x^2 / n,
+        centered_yy = sum_y2 - sum_y^2 / n,
+        centered_xy = sum_xy - sum_x * sum_y / n,
+        slope = centered_xy / centered_xx,
+        residual_ss = centered_yy - slope * centered_xy,
+        slope_se = sqrt((residual_ss / (n - 2)) / centered_xx),
         t_value = slope / slope_se,
         p_value = 2 * stats::pt(-abs(t_value), df = n - 2)
       ) |>
@@ -287,11 +287,11 @@ mr <- summarise_big(
   .strategy = "map_reduce",
   .map_reduce = list(
     n = ~ dplyr::n(),
-    sx = ~ sum(x)
+    sum_x = ~ sum(x)
   ),
   .finalize = function(state) {
     state |>
-      mutate(mean_x = sx / n) |>
+      mutate(mean_x = sum_x / n) |>
       select(grp, mean_x)
   }
 ) |>
