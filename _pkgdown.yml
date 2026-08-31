@@ -1,24 +1,36 @@
 url: https://larry77.github.io/summarisebig/
+
 template:
   bootstrap: 5
+
 home:
   title: summarisebig — grouped summaries for large Arrow datasets
   description: |
-    Keep grouped computation in Arrow as long as possible, then use compact R finalization or bounded raw-group materialization when necessary.
+    Keep grouped computation in Arrow as long as possible, then use compact
+    R finalization or bounded raw-group materialization when necessary.
+
 navbar:
   structure:
     left:
-    - intro
-    - reference
-    - articles
-    - news
+      - intro
+      - reference
+      - articles
+      - news
     right:
-    - search
-    - github
+      - search
+      - github
+
 reference:
-- title: Grouped summaries
-  contents: summarise_big
+  - title: Package overview
+    contents:
+      - summarisebig-package
+
+  - title: Grouped summaries
+    contents:
+      - summarise_big
+
 articles:
-- title: Get started
-  contents: summarisebig
+  - title: Get started
+    contents:
+      - summarisebig
 
