@@ -87,10 +87,15 @@ therefore not a reason to use MapReduce or materialization.
 
 ## 2. Go as far as possible in Arrow, then finalize in R
 
-Suppose a final result can be reconstructed from a few group-level
-quantities. For sample variance we only need the number of observations,
-the sum, and the sum of squares. Arrow calculates those quantities on
-the full dataset and R receives only the compact state table.
+Sometimes the final statistic is awkward to express as one native Arrow
+grouped summary, but it can still be reconstructed from a small fixed
+set of sufficient statistics.
+
+A useful example is simple linear-regression inference. Fitting
+`lm(y ~ x)` in R requires the raw observations, but the slope, its
+standard error, and its p-value can be reconstructed from six compact
+group-level quantities: `n`, `sum(x)`, `sum(y)`, `sum(x^2)`, `sum(y^2)`,
+and `sum(x*y)`.
 
 ``` r
 
@@ -100,31 +105,52 @@ summarise_big(
   .strategy = "map_reduce",
   .map_reduce = list(
     n = ~ dplyr::n(),
-    sx = ~ sum(x),
-    sx2 = ~ sum(x * x)
+    sum_x = ~ sum(x),
+    sum_y = ~ sum(y),
+    sum_x2 = ~ sum(x * x),
+    sum_y2 = ~ sum(y * y),
+    sum_xy = ~ sum(x * y)
   ),
   .finalize = function(state) {
     state |>
       mutate(
-        variance = (sx2 - sx * sx / n) / (n - 1)
+        centered_xx = sum_x2 - sum_x^2 / n,
+        centered_yy = sum_y2 - sum_y^2 / n,
+        centered_xy = sum_xy - sum_x * sum_y / n,
+        slope = centered_xy / centered_xx,
+        residual_ss = centered_yy - slope * centered_xy,
+        slope_se = sqrt((residual_ss / (n - 2)) / centered_xx),
+        t_value = slope / slope_se,
+        p_value = 2 * stats::pt(-abs(t_value), df = n - 2)
       ) |>
-      select(grp, variance)
+      select(grp, slope, slope_se, p_value)
   }
 ) |>
   arrange(grp)
-#> # A tibble: 3 × 2
-#>   grp   variance
-#>   <chr>    <dbl>
-#> 1 A         9.58
-#> 2 B        11.7 
-#> 3 C        26.2
+#> # A tibble: 3 × 4
+#>   grp   slope slope_se p_value
+#>   <chr> <dbl>    <dbl>   <dbl>
+#> 1 A     1        0     0      
+#> 2 B     1.33     0.118 0.00777
+#> 3 C     0.829    0.206 0.0566
 ```
+
+Arrow performs the large-data reduction; only one compact row of
+sufficient statistics per group enters ordinary R. The finalizer can
+then use ordinary R functions such as
+[`stats::pt()`](https://rdrr.io/r/stats/TDist.html) without
+materializing the original groups.
 
 `map_reduce` does **not** discover the decomposition automatically. The
 user supplies the Arrow-computable building blocks and the R finalizer.
 This is often the most attractive route after pure Arrow because the
 large-data work remains inside Arrow and only a few numbers per group
 cross into R.
+
+The point is not to reimplement statistics that Arrow already supports
+natively. For example, Arrow already has variance aggregation, so using
+MapReduce merely to reconstruct a variance would normally be
+unnecessary.
 
 ## 3. Arbitrary R functions: `parallel_chunks`
 

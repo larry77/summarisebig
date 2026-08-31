@@ -139,10 +139,15 @@ therefore not a reason to use MapReduce or materialization.</p>
 <div class="section level2">
 <h2 id="go-as-far-as-possible-in-arrow-then-finalize-in-r">2. Go as far as possible in Arrow, then finalize in R<a class="anchor" aria-label="anchor" href="#go-as-far-as-possible-in-arrow-then-finalize-in-r"></a>
 </h2>
-<p>Suppose a final result can be reconstructed from a few group-level
-quantities. For sample variance we only need the number of observations,
-the sum, and the sum of squares. Arrow calculates those quantities on
-the full dataset and R receives only the compact state table.</p>
+<p>Sometimes the final statistic is awkward to express as one native
+Arrow grouped summary, but it can still be reconstructed from a small
+fixed set of sufficient statistics.</p>
+<p>A useful example is simple linear-regression inference. Fitting
+<code>lm(y ~ x)</code> in R requires the raw observations, but the
+slope, its standard error, and its p-value can be reconstructed from six
+compact group-level quantities: <code>n</code>, <code>sum(x)</code>,
+<code>sum(y)</code>, <code>sum(x^2)</code>, <code>sum(y^2)</code>, and
+<code>sum(x*y)</code>.</p>
 <div class="sourceCode" id="cb4"><pre class="downlit sourceCode r">
 <code class="sourceCode R"><span><span class="fu"><a href="../reference/summarise_big.html">summarise_big</a></span><span class="op">(</span></span>
 <span>  <span class="va">ds</span>,</span>
@@ -150,29 +155,47 @@ the full dataset and R receives only the compact state table.</p>
 <span>  .strategy <span class="op">=</span> <span class="st">"map_reduce"</span>,</span>
 <span>  .map_reduce <span class="op">=</span> <span class="fu"><a href="https://rdrr.io/r/base/list.html" class="external-link">list</a></span><span class="op">(</span></span>
 <span>    n <span class="op">=</span> <span class="op">~</span> <span class="fu">dplyr</span><span class="fu">::</span><span class="fu"><a href="https://dplyr.tidyverse.org/reference/context.html" class="external-link">n</a></span><span class="op">(</span><span class="op">)</span>,</span>
-<span>    sx <span class="op">=</span> <span class="op">~</span> <span class="fu"><a href="https://rdrr.io/r/base/sum.html" class="external-link">sum</a></span><span class="op">(</span><span class="va">x</span><span class="op">)</span>,</span>
-<span>    sx2 <span class="op">=</span> <span class="op">~</span> <span class="fu"><a href="https://rdrr.io/r/base/sum.html" class="external-link">sum</a></span><span class="op">(</span><span class="va">x</span> <span class="op">*</span> <span class="va">x</span><span class="op">)</span></span>
+<span>    sum_x <span class="op">=</span> <span class="op">~</span> <span class="fu"><a href="https://rdrr.io/r/base/sum.html" class="external-link">sum</a></span><span class="op">(</span><span class="va">x</span><span class="op">)</span>,</span>
+<span>    sum_y <span class="op">=</span> <span class="op">~</span> <span class="fu"><a href="https://rdrr.io/r/base/sum.html" class="external-link">sum</a></span><span class="op">(</span><span class="va">y</span><span class="op">)</span>,</span>
+<span>    sum_x2 <span class="op">=</span> <span class="op">~</span> <span class="fu"><a href="https://rdrr.io/r/base/sum.html" class="external-link">sum</a></span><span class="op">(</span><span class="va">x</span> <span class="op">*</span> <span class="va">x</span><span class="op">)</span>,</span>
+<span>    sum_y2 <span class="op">=</span> <span class="op">~</span> <span class="fu"><a href="https://rdrr.io/r/base/sum.html" class="external-link">sum</a></span><span class="op">(</span><span class="va">y</span> <span class="op">*</span> <span class="va">y</span><span class="op">)</span>,</span>
+<span>    sum_xy <span class="op">=</span> <span class="op">~</span> <span class="fu"><a href="https://rdrr.io/r/base/sum.html" class="external-link">sum</a></span><span class="op">(</span><span class="va">x</span> <span class="op">*</span> <span class="va">y</span><span class="op">)</span></span>
 <span>  <span class="op">)</span>,</span>
 <span>  .finalize <span class="op">=</span> <span class="kw">function</span><span class="op">(</span><span class="va">state</span><span class="op">)</span> <span class="op">{</span></span>
 <span>    <span class="va">state</span> <span class="op">|&gt;</span></span>
 <span>      <span class="fu"><a href="https://dplyr.tidyverse.org/reference/mutate.html" class="external-link">mutate</a></span><span class="op">(</span></span>
-<span>        variance <span class="op">=</span> <span class="op">(</span><span class="va">sx2</span> <span class="op">-</span> <span class="va">sx</span> <span class="op">*</span> <span class="va">sx</span> <span class="op">/</span> <span class="va">n</span><span class="op">)</span> <span class="op">/</span> <span class="op">(</span><span class="va">n</span> <span class="op">-</span> <span class="fl">1</span><span class="op">)</span></span>
+<span>        centered_xx <span class="op">=</span> <span class="va">sum_x2</span> <span class="op">-</span> <span class="va">sum_x</span><span class="op">^</span><span class="fl">2</span> <span class="op">/</span> <span class="va">n</span>,</span>
+<span>        centered_yy <span class="op">=</span> <span class="va">sum_y2</span> <span class="op">-</span> <span class="va">sum_y</span><span class="op">^</span><span class="fl">2</span> <span class="op">/</span> <span class="va">n</span>,</span>
+<span>        centered_xy <span class="op">=</span> <span class="va">sum_xy</span> <span class="op">-</span> <span class="va">sum_x</span> <span class="op">*</span> <span class="va">sum_y</span> <span class="op">/</span> <span class="va">n</span>,</span>
+<span>        slope <span class="op">=</span> <span class="va">centered_xy</span> <span class="op">/</span> <span class="va">centered_xx</span>,</span>
+<span>        residual_ss <span class="op">=</span> <span class="va">centered_yy</span> <span class="op">-</span> <span class="va">slope</span> <span class="op">*</span> <span class="va">centered_xy</span>,</span>
+<span>        slope_se <span class="op">=</span> <span class="fu"><a href="https://rdrr.io/r/base/MathFun.html" class="external-link">sqrt</a></span><span class="op">(</span><span class="op">(</span><span class="va">residual_ss</span> <span class="op">/</span> <span class="op">(</span><span class="va">n</span> <span class="op">-</span> <span class="fl">2</span><span class="op">)</span><span class="op">)</span> <span class="op">/</span> <span class="va">centered_xx</span><span class="op">)</span>,</span>
+<span>        t_value <span class="op">=</span> <span class="va">slope</span> <span class="op">/</span> <span class="va">slope_se</span>,</span>
+<span>        p_value <span class="op">=</span> <span class="fl">2</span> <span class="op">*</span> <span class="fu">stats</span><span class="fu">::</span><span class="fu"><a href="https://rdrr.io/r/stats/TDist.html" class="external-link">pt</a></span><span class="op">(</span><span class="op">-</span><span class="fu"><a href="https://rdrr.io/r/base/MathFun.html" class="external-link">abs</a></span><span class="op">(</span><span class="va">t_value</span><span class="op">)</span>, df <span class="op">=</span> <span class="va">n</span> <span class="op">-</span> <span class="fl">2</span><span class="op">)</span></span>
 <span>      <span class="op">)</span> <span class="op">|&gt;</span></span>
-<span>      <span class="fu"><a href="https://dplyr.tidyverse.org/reference/select.html" class="external-link">select</a></span><span class="op">(</span><span class="va">grp</span>, <span class="va">variance</span><span class="op">)</span></span>
+<span>      <span class="fu"><a href="https://dplyr.tidyverse.org/reference/select.html" class="external-link">select</a></span><span class="op">(</span><span class="va">grp</span>, <span class="va">slope</span>, <span class="va">slope_se</span>, <span class="va">p_value</span><span class="op">)</span></span>
 <span>  <span class="op">}</span></span>
 <span><span class="op">)</span> <span class="op">|&gt;</span></span>
 <span>  <span class="fu"><a href="https://dplyr.tidyverse.org/reference/arrange.html" class="external-link">arrange</a></span><span class="op">(</span><span class="va">grp</span><span class="op">)</span></span>
-<span><span class="co">#&gt; <span style="color: #949494;"># A tibble: 3 × 2</span></span></span>
-<span><span class="co">#&gt;   grp   variance</span></span>
-<span><span class="co">#&gt;   <span style="color: #949494; font-style: italic;">&lt;chr&gt;</span>    <span style="color: #949494; font-style: italic;">&lt;dbl&gt;</span></span></span>
-<span><span class="co">#&gt; <span style="color: #BCBCBC;">1</span> A         9.58</span></span>
-<span><span class="co">#&gt; <span style="color: #BCBCBC;">2</span> B        11.7 </span></span>
-<span><span class="co">#&gt; <span style="color: #BCBCBC;">3</span> C        26.2</span></span></code></pre></div>
+<span><span class="co">#&gt; <span style="color: #949494;"># A tibble: 3 × 4</span></span></span>
+<span><span class="co">#&gt;   grp   slope slope_se p_value</span></span>
+<span><span class="co">#&gt;   <span style="color: #949494; font-style: italic;">&lt;chr&gt;</span> <span style="color: #949494; font-style: italic;">&lt;dbl&gt;</span>    <span style="color: #949494; font-style: italic;">&lt;dbl&gt;</span>   <span style="color: #949494; font-style: italic;">&lt;dbl&gt;</span></span></span>
+<span><span class="co">#&gt; <span style="color: #BCBCBC;">1</span> A     1        0     0      </span></span>
+<span><span class="co">#&gt; <span style="color: #BCBCBC;">2</span> B     1.33     0.118 0.007<span style="text-decoration: underline;">77</span></span></span>
+<span><span class="co">#&gt; <span style="color: #BCBCBC;">3</span> C     0.829    0.206 0.056<span style="text-decoration: underline;">6</span></span></span></code></pre></div>
+<p>Arrow performs the large-data reduction; only one compact row of
+sufficient statistics per group enters ordinary R. The finalizer can
+then use ordinary R functions such as <code><a href="https://rdrr.io/r/stats/TDist.html" class="external-link">stats::pt()</a></code> without
+materializing the original groups.</p>
 <p><code>map_reduce</code> does <strong>not</strong> discover the
 decomposition automatically. The user supplies the Arrow-computable
 building blocks and the R finalizer. This is often the most attractive
 route after pure Arrow because the large-data work remains inside Arrow
 and only a few numbers per group cross into R.</p>
+<p>The point is not to reimplement statistics that Arrow already
+supports natively. For example, Arrow already has variance aggregation,
+so using MapReduce merely to reconstruct a variance would normally be
+unnecessary.</p>
 </div>
 <div class="section level2">
 <h2 id="arbitrary-r-functions-parallel_chunks">3. Arbitrary R functions: <code>parallel_chunks</code><a class="anchor" aria-label="anchor" href="#arbitrary-r-functions-parallel_chunks"></a>
