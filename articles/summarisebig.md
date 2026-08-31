@@ -1,0 +1,246 @@
+# Getting started with summarisebig
+
+``` r
+
+library(arrow)
+#> 
+#> Attaching package: 'arrow'
+#> The following object is masked from 'package:utils':
+#> 
+#>     timestamp
+library(dplyr)
+#> 
+#> Attaching package: 'dplyr'
+#> The following objects are masked from 'package:stats':
+#> 
+#>     filter, lag
+#> The following objects are masked from 'package:base':
+#> 
+#>     intersect, setdiff, setequal, union
+library(summarisebig)
+```
+
+## What problem does `summarisebig` solve?
+
+Arrow is very good at filtering, transforming, grouping, and aggregating
+data without first loading an entire dataset into an R data frame. The
+difficult case is when a grouped calculation eventually needs ordinary R
+code that Arrow cannot execute directly.
+
+[`summarise_big()`](https://larry77.github.io/summarisebig/reference/summarise_big.md)
+uses the following hierarchy:
+
+1.  Try to compute the complete grouped summary in Arrow.
+2.  If the answer can be reconstructed from compact Arrow-computable
+    state, use `.strategy = "map_reduce"` and let R perform only the
+    final combination.
+3.  If the custom R function genuinely needs raw observations,
+    materialize complete groups in bounded chunks with `parallel_chunks`
+    or `shared_chunk`.
+
+The examples below use a tiny Parquet dataset so that they are safe to
+run in a vignette. The same interface is intended for datasets much
+larger than memory.
+
+``` r
+
+d <- data.frame(
+  grp = rep(c("A", "B", "C"), each = 4),
+  row_id = rep(1:4, 3),
+  x = c(1, 2, 4, 8, 10, 12, 14, 18, 3, 6, 9, 15),
+  y = c(2, 3, 5, 9, 9, 13, 15, 20, 5, 5, 11, 14),
+  txt = c("alpha", "bravo", "charlie", "delta",
+          "echo", "foxtrot", "golf", "hotel",
+          "india", "juliet", "kilo", "lima")
+)
+
+path <- tempfile("summarisebig-vignette-")
+arrow::write_dataset(d, path, format = "parquet")
+ds <- arrow::open_dataset(path)
+```
+
+## 1. Let Arrow do everything when it can
+
+The ordinary strategies first try the entire expression in Arrow. For a
+supported grouped summary, raw observations never need to become an R
+data frame.
+
+``` r
+
+summarise_big(
+  ds,
+  result = mean(x),
+  .by = grp
+) |>
+  arrange(grp)
+#> # A tibble: 3 × 2
+#>   grp   result
+#>   <chr>  <dbl>
+#> 1 A       3.75
+#> 2 B      13.5 
+#> 3 C       8.25
+```
+
+A fairly complicated expression can still remain entirely in Arrow if
+all its parts can be translated by Arrow. Complexity by itself is
+therefore not a reason to use MapReduce or materialization.
+
+## 2. Go as far as possible in Arrow, then finalize in R
+
+Suppose a final result can be reconstructed from a few group-level
+quantities. For sample variance we only need the number of observations,
+the sum, and the sum of squares. Arrow calculates those quantities on
+the full dataset and R receives only the compact state table.
+
+``` r
+
+summarise_big(
+  ds,
+  .by = grp,
+  .strategy = "map_reduce",
+  .map_reduce = list(
+    n = ~ dplyr::n(),
+    sx = ~ sum(x),
+    sx2 = ~ sum(x * x)
+  ),
+  .finalize = function(state) {
+    state |>
+      mutate(
+        variance = (sx2 - sx * sx / n) / (n - 1)
+      ) |>
+      select(grp, variance)
+  }
+) |>
+  arrange(grp)
+#> # A tibble: 3 × 2
+#>   grp   variance
+#>   <chr>    <dbl>
+#> 1 A         9.58
+#> 2 B        11.7 
+#> 3 C        26.2
+```
+
+`map_reduce` does **not** discover the decomposition automatically. The
+user supplies the Arrow-computable building blocks and the R finalizer.
+This is often the most attractive route after pure Arrow because the
+large-data work remains inside Arrow and only a few numbers per group
+cross into R.
+
+## 3. Arbitrary R functions: `parallel_chunks`
+
+Some summaries genuinely need the raw values. Here is an intentionally
+ordinary R function based on exact quantiles:
+
+``` r
+
+interquartile_span <- function(x) {
+  q <- stats::quantile(
+    x,
+    probs = c(0.25, 0.75),
+    names = FALSE,
+    type = 7
+  )
+  q[[2]] - q[[1]]
+}
+```
+
+We disable the Arrow fast path in this example so that the materialized
+route is exercised explicitly. Complete groups are packed into bounded
+chunks and separate chunks can be processed by different Mirai workers.
+
+``` r
+
+summarise_big(
+  ds,
+  result = interquartile_span(x),
+  .by = grp,
+  .strategy = "parallel_chunks",
+  .workers = 2,
+  .chunk_rows = 4,
+  .try_arrow = FALSE
+) |>
+  arrange(grp)
+#> # A tibble: 3 × 2
+#>   grp   result
+#>   <chr>  <dbl>
+#> 1 A       3.25
+#> 2 B       3.5 
+#> 3 C       5.25
+```
+
+For expensive user-defined R functions this strategy can benefit
+substantially from multiple workers. For very cheap functions, parallel
+startup and scheduling overhead can dominate, so more workers are not
+automatically faster.
+
+## 4. Lower-memory materialization: `shared_chunk`
+
+`shared_chunk` materializes only one disk chunk at a time. It first
+sorts the chunk so that each group is contiguous, then divides complete
+groups into row-balanced tasks. With multiple workers and the optional
+`mori` package, the chunk can be shared rather than copied to every
+worker.
+
+The following order-sensitive string summary also demonstrates why
+`.order_by` exists: Arrow Dataset physical row order should not be
+treated as meaningful.
+
+``` r
+
+initials_in_order <- function(txt) {
+  paste0(substr(txt, 1, 1), collapse = "")
+}
+
+summarise_big(
+  ds,
+  result = initials_in_order(txt),
+  .by = grp,
+  .order_by = "row_id",
+  .strategy = "shared_chunk",
+  .workers = 1,
+  .chunk_rows = 8,
+  .task_rows = 4,
+  .try_arrow = FALSE
+) |>
+  arrange(grp)
+#>   grp result
+#> 1   A   abcd
+#> 2   B   efgh
+#> 3   C   ijkl
+```
+
+Using one worker above keeps the vignette independent of optional
+shared-memory support. With `mori` installed, the same call can use
+multiple workers:
+
+``` r
+
+summarise_big(
+  ds,
+  result = initials_in_order(txt),
+  .by = grp,
+  .order_by = "row_id",
+  .strategy = "shared_chunk",
+  .workers = 2,
+  .chunk_rows = 8,
+  .task_rows = 4,
+  .try_arrow = FALSE
+)
+```
+
+## Choosing a strategy
+
+A useful decision rule is:
+
+| Situation | Preferred route |
+|----|----|
+| Arrow can translate the complete expression | Arrow fast path |
+| Final answer needs R but compact Arrow state is sufficient | `map_reduce` |
+| Arbitrary R needs raw rows and throughput matters most | `parallel_chunks` |
+| Arbitrary R needs raw rows and peak memory matters most | `shared_chunk` |
+
+For the two materialized strategies, a complete statistical group is
+never split. Therefore a genuinely opaque R calculation still requires
+each individual group to fit in memory. If one group is itself too
+large, the calculation must be reformulated in Arrow or as a compact
+reduction if that is mathematically possible.
