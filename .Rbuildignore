@@ -8,3 +8,6 @@
 ^_pkgdown[.]yml$
 ^[.]github$
 ^\.github$
+^_pkgdown\.yml$
+^docs$
+^pkgdown$
