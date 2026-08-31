@@ -33,3 +33,5 @@ Suggests:
 Config/testthat/edition: 3
 VignetteBuilder: knitr
 Config/Needs/website: pkgdown
+URL: https://github.com/larry77/summarisebig
+BugReports: https://github.com/larry77/summarisebig/issues
