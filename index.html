@@ -155,7 +155,22 @@ Does arbitrary R need the raw observations?
 </h2>
 <p>Sometimes the final statistic is awkward or impossible to express as one native Arrow grouped summary, but it can still be reconstructed from a small fixed set of sufficient statistics.</p>
 <p>A useful example is simple linear-regression inference. Fitting <code>lm(y ~ x)</code> in R requires the raw observations, but the slope, its standard error, and its p-value can be reconstructed from six compact group-level quantities: <code>n</code>, <code>sum(x)</code>, <code>sum(y)</code>, <code>sum(x^2)</code>, <code>sum(y^2)</code>, and <code>sum(x*y)</code>.</p>
-<div class="sourceCode" id="cb6"><pre class="downlit sourceCode r">
+<div class="section level3">
+<h3 id="how-finalize-works">How <code>.finalize</code> works<a class="anchor" aria-label="anchor" href="#how-finalize-works"></a>
+</h3>
+<p>With <code>.strategy = "map_reduce"</code>, Arrow first computes the expressions supplied in <code>.map_reduce</code>. The resulting small table is collected into R as a tibble, with one row per group and columns corresponding to the quantities named in <code>.map_reduce</code>.</p>
+<p>That tibble is then passed as the <strong>single argument</strong> to <code>.finalize</code>. In the example below,</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb6-1"><a href="#cb6-1" tabindex="-1"></a>.finalize <span class="ot">=</span> <span class="cf">function</span>(partials) {</span>
+<span id="cb6-2"><a href="#cb6-2" tabindex="-1"></a>  partials <span class="sc">|&gt;</span></span>
+<span id="cb6-3"><a href="#cb6-3" tabindex="-1"></a>    ...</span>
+<span id="cb6-4"><a href="#cb6-4" tabindex="-1"></a>}</span></code></pre></div>
+<p><code>function(partials) { ... }</code> is simply an <strong>anonymous R function</strong>. The name <code>partials</code> has no special meaning: it could just as well be called <code>x</code>, <code>state</code>, or anything else. What matters is that the function receives the compact tibble produced by the Arrow reduction step.</p>
+<p>Conceptually, <code><a href="reference/summarise_big.html">summarise_big()</a></code> does something like:</p>
+<div class="sourceCode" id="cb7"><pre class="downlit sourceCode r">
+<code class="sourceCode R"><span><span class="va">partials</span> <span class="op">&lt;-</span> <span class="va">arrow_reduction</span> <span class="op">|&gt;</span> <span class="fu"><a href="https://dplyr.tidyverse.org/reference/compute.html" class="external-link">collect</a></span><span class="op">(</span><span class="op">)</span></span>
+<span><span class="va">result</span> <span class="op">&lt;-</span> <span class="fu">.finalize</span><span class="op">(</span><span class="va">partials</span><span class="op">)</span></span></code></pre></div>
+<p>The finalizer therefore works on the compact table of sufficient statistics, not on the original raw observations. It must return a data frame or tibble.</p>
+<div class="sourceCode" id="cb8"><pre class="downlit sourceCode r">
 <code class="sourceCode R"><span><span class="va">regression_mr</span> <span class="op">&lt;-</span> <span class="fu"><a href="reference/summarise_big.html">summarise_big</a></span><span class="op">(</span></span>
 <span>  <span class="va">ds</span>,</span>
 <span>  .by <span class="op">=</span> <span class="va">grp</span>,</span>
@@ -168,8 +183,8 @@ Does arbitrary R need the raw observations?
 <span>    sum_y2 <span class="op">=</span> <span class="op">~</span> <span class="fu"><a href="https://rdrr.io/r/base/sum.html" class="external-link">sum</a></span><span class="op">(</span><span class="va">y</span> <span class="op">*</span> <span class="va">y</span><span class="op">)</span>,</span>
 <span>    sum_xy <span class="op">=</span> <span class="op">~</span> <span class="fu"><a href="https://rdrr.io/r/base/sum.html" class="external-link">sum</a></span><span class="op">(</span><span class="va">x</span> <span class="op">*</span> <span class="va">y</span><span class="op">)</span></span>
 <span>  <span class="op">)</span>,</span>
-<span>  .finalize <span class="op">=</span> <span class="kw">function</span><span class="op">(</span><span class="va">state</span><span class="op">)</span> <span class="op">{</span></span>
-<span>    <span class="va">state</span> <span class="op">|&gt;</span></span>
+<span>  .finalize <span class="op">=</span> <span class="kw">function</span><span class="op">(</span><span class="va">partials</span><span class="op">)</span> <span class="op">{</span></span>
+<span>    <span class="va">partials</span> <span class="op">|&gt;</span></span>
 <span>      <span class="fu"><a href="https://dplyr.tidyverse.org/reference/mutate.html" class="external-link">mutate</a></span><span class="op">(</span></span>
 <span>        centered_xx <span class="op">=</span> <span class="va">sum_x2</span> <span class="op">-</span> <span class="va">sum_x</span><span class="op">^</span><span class="fl">2</span> <span class="op">/</span> <span class="va">n</span>,</span>
 <span>        centered_yy <span class="op">=</span> <span class="va">sum_y2</span> <span class="op">-</span> <span class="va">sum_y</span><span class="op">^</span><span class="fl">2</span> <span class="op">/</span> <span class="va">n</span>,</span>
@@ -188,17 +203,18 @@ Does arbitrary R need the raw observations?
 <p>Arrow performs the large-data reduction; only one compact row of sufficient statistics per group enters ordinary R. The finalizer can then use ordinary R functions such as <code><a href="https://rdrr.io/r/stats/TDist.html" class="external-link">stats::pt()</a></code> without materializing the original groups.</p>
 <p>This is the kind of problem for which <code>map_reduce</code> is intended. The point is <strong>not</strong> to reimplement statistics that Arrow already supports natively. For example, Arrow already has variance aggregation, so using MapReduce merely to reconstruct a variance would normally be unnecessary. If Arrow can compute the complete requested result directly, the Arrow fast path remains preferable.</p>
 </div>
+</div>
 <div class="section level2">
 <h2 id="id_3-arbitrary-r-functions-parallel_chunks">3. Arbitrary R functions: <code>parallel_chunks</code>
 <a class="anchor" aria-label="anchor" href="#id_3-arbitrary-r-functions-parallel_chunks"></a>
 </h2>
 <p>Some functions genuinely require the raw observations of each group. Consider a normal R function that fits a regression and returns its slope:</p>
-<div class="sourceCode" id="cb7"><pre class="downlit sourceCode r">
+<div class="sourceCode" id="cb9"><pre class="downlit sourceCode r">
 <code class="sourceCode R"><span><span class="va">slope_r</span> <span class="op">&lt;-</span> <span class="kw">function</span><span class="op">(</span><span class="va">x</span>, <span class="va">y</span><span class="op">)</span> <span class="op">{</span></span>
 <span>  <span class="fu"><a href="https://rdrr.io/r/base/unname.html" class="external-link">unname</a></span><span class="op">(</span><span class="fu">stats</span><span class="fu">::</span><span class="fu"><a href="https://rdrr.io/r/stats/coef.html" class="external-link">coef</a></span><span class="op">(</span><span class="fu">stats</span><span class="fu">::</span><span class="fu"><a href="https://rdrr.io/r/stats/lm.html" class="external-link">lm</a></span><span class="op">(</span><span class="va">y</span> <span class="op">~</span> <span class="va">x</span><span class="op">)</span><span class="op">)</span><span class="op">[[</span><span class="fl">2</span><span class="op">]</span><span class="op">]</span><span class="op">)</span></span>
 <span><span class="op">}</span></span></code></pre></div>
 <p><code>parallel_chunks</code> keeps statistical groups intact, packs them into bounded chunks, and allows different workers to materialize and process different chunks at the same time.</p>
-<div class="sourceCode" id="cb8"><pre class="downlit sourceCode r">
+<div class="sourceCode" id="cb10"><pre class="downlit sourceCode r">
 <code class="sourceCode R"><span><span class="va">slope_parallel</span> <span class="op">&lt;-</span> <span class="fu"><a href="reference/summarise_big.html">summarise_big</a></span><span class="op">(</span></span>
 <span>  <span class="va">ds</span>,</span>
 <span>  slope <span class="op">=</span> <span class="fu">slope_r</span><span class="op">(</span><span class="va">x</span>, <span class="va">y</span><span class="op">)</span>,</span>
@@ -219,7 +235,7 @@ Does arbitrary R need the raw observations?
 </h2>
 <p><code>shared_chunk</code> is the memory-oriented alternative. It materializes one disk chunk at a time, makes complete groups contiguous, and divides those groups into row-balanced tasks. With multiple workers, the optional <code>mori</code> package is used to share the materialized chunk rather than copying it to every worker.</p>
 <p>With <code>mori</code> installed:</p>
-<div class="sourceCode" id="cb9"><pre class="downlit sourceCode r">
+<div class="sourceCode" id="cb11"><pre class="downlit sourceCode r">
 <code class="sourceCode R"><span><span class="va">slope_shared</span> <span class="op">&lt;-</span> <span class="fu"><a href="reference/summarise_big.html">summarise_big</a></span><span class="op">(</span></span>
 <span>  <span class="va">ds</span>,</span>
 <span>  slope <span class="op">=</span> <span class="fu">slope_r</span><span class="op">(</span><span class="va">x</span>, <span class="va">y</span><span class="op">)</span>,</span>
@@ -240,7 +256,7 @@ Does arbitrary R need the raw observations?
 </h2>
 <p>Execution strategy is about <em>how</em> the calculation is performed, not its mathematical result.</p>
 <p>For a simple mean, we can deliberately force all four routes and compare them. Materializing a mean is inefficient and is done here only as a correctness demonstration.</p>
-<div class="sourceCode" id="cb10"><pre class="downlit sourceCode r">
+<div class="sourceCode" id="cb12"><pre class="downlit sourceCode r">
 <code class="sourceCode R"><span><span class="va">native</span> <span class="op">&lt;-</span> <span class="fu"><a href="reference/summarise_big.html">summarise_big</a></span><span class="op">(</span></span>
 <span>  <span class="va">ds</span>,</span>
 <span>  mean_x <span class="op">=</span> <span class="fu"><a href="https://rdrr.io/r/base/mean.html" class="external-link">mean</a></span><span class="op">(</span><span class="va">x</span><span class="op">)</span>,</span>
@@ -256,8 +272,8 @@ Does arbitrary R need the raw observations?
 <span>    n <span class="op">=</span> <span class="op">~</span> <span class="fu">dplyr</span><span class="fu">::</span><span class="fu"><a href="https://dplyr.tidyverse.org/reference/context.html" class="external-link">n</a></span><span class="op">(</span><span class="op">)</span>,</span>
 <span>    sum_x <span class="op">=</span> <span class="op">~</span> <span class="fu"><a href="https://rdrr.io/r/base/sum.html" class="external-link">sum</a></span><span class="op">(</span><span class="va">x</span><span class="op">)</span></span>
 <span>  <span class="op">)</span>,</span>
-<span>  .finalize <span class="op">=</span> <span class="kw">function</span><span class="op">(</span><span class="va">state</span><span class="op">)</span> <span class="op">{</span></span>
-<span>    <span class="va">state</span> <span class="op">|&gt;</span></span>
+<span>  .finalize <span class="op">=</span> <span class="kw">function</span><span class="op">(</span><span class="va">partials</span><span class="op">)</span> <span class="op">{</span></span>
+<span>    <span class="va">partials</span> <span class="op">|&gt;</span></span>
 <span>      <span class="fu"><a href="https://dplyr.tidyverse.org/reference/mutate.html" class="external-link">mutate</a></span><span class="op">(</span>mean_x <span class="op">=</span> <span class="va">sum_x</span> <span class="op">/</span> <span class="va">n</span><span class="op">)</span> <span class="op">|&gt;</span></span>
 <span>      <span class="fu"><a href="https://dplyr.tidyverse.org/reference/select.html" class="external-link">select</a></span><span class="op">(</span><span class="va">grp</span>, <span class="va">mean_x</span><span class="op">)</span></span>
 <span>  <span class="op">}</span></span>
@@ -298,7 +314,7 @@ Does arbitrary R need the raw observations?
 <h2 id="order-sensitive-summaries">Order-sensitive summaries<a class="anchor" aria-label="anchor" href="#order-sensitive-summaries"></a>
 </h2>
 <p>Arrow Dataset physical row order should not be treated as meaningful. If an R summary depends on order, specify it explicitly with <code>.order_by</code>.</p>
-<div class="sourceCode" id="cb11"><pre class="downlit sourceCode r">
+<div class="sourceCode" id="cb13"><pre class="downlit sourceCode r">
 <code class="sourceCode R"><span><span class="va">ordered_dat</span> <span class="op">&lt;-</span> <span class="fu"><a href="https://rdrr.io/r/base/transform.html" class="external-link">transform</a></span><span class="op">(</span></span>
 <span>  <span class="va">dat</span>,</span>
 <span>  txt <span class="op">=</span> <span class="fu"><a href="https://rdrr.io/r/base/paste.html" class="external-link">paste0</a></span><span class="op">(</span><span class="st">"row"</span>, <span class="va">row_id</span><span class="op">)</span></span>
@@ -473,7 +489,7 @@ Does arbitrary R need the raw observations?
 <h2 id="documentation-and-development">Documentation and development<a class="anchor" aria-label="anchor" href="#documentation-and-development"></a>
 </h2>
 <p>The package includes a getting-started vignette:</p>
-<div class="sourceCode" id="cb12"><pre class="downlit sourceCode r">
+<div class="sourceCode" id="cb14"><pre class="downlit sourceCode r">
 <code class="sourceCode R"><span><span class="fu"><a href="https://rdrr.io/r/utils/vignette.html" class="external-link">vignette</a></span><span class="op">(</span><span class="st">"summarisebig"</span>, package <span class="op">=</span> <span class="st">"summarisebig"</span><span class="op">)</span></span></code></pre></div>
 <p>The repository also contains the benchmark scripts used during development. Large generated benchmark datasets are not included in the built CRAN source package.</p>
 </div>
