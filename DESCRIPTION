@@ -1,0 +1,35 @@
+Package: summarisebig
+Type: Package
+Title: Grouped Summaries for Large Arrow Datasets
+Version: 0.1.0
+Authors@R: person("Lorenzo", "Isella", email = "lorenzo.isella@gmail.com", role = c("aut", "cre"))
+Description: Provides a dplyr-like interface for grouped summaries on large
+    Arrow datasets. Complete summaries are attempted in Arrow first. When a
+    result can be reconstructed from Arrow-computable sufficient statistics,
+    an explicit reduction and R finalization strategy is available. For
+    arbitrary R functions that require raw group observations, complete groups
+    are materialized in bounded chunks, with optional parallel execution and
+    shared-memory processing.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.2
+Depends: R (>= 4.3.0)
+Imports:
+    arrow,
+    dplyr,
+    future,
+    future.mirai,
+    futurize,
+    furrr (>= 0.4.0),
+    purrr,
+    rlang
+Suggests:
+    knitr,
+    mori,
+    rmarkdown,
+    testthat (>= 3.0.0),
+    withr
+Config/testthat/edition: 3
+VignetteBuilder: knitr
+Config/Needs/website: pkgdown
