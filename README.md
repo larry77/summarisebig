@@ -158,6 +158,38 @@ R requires the raw observations, but the slope, its standard error, and its
 p-value can be reconstructed from six compact group-level quantities: `n`,
 `sum(x)`, `sum(y)`, `sum(x^2)`, `sum(y^2)`, and `sum(x*y)`.
 
+### How `.finalize` works
+
+With `.strategy = "map_reduce"`, Arrow first computes the expressions supplied
+in `.map_reduce`. The resulting small table is collected into R as a tibble,
+with one row per group and columns corresponding to the quantities named in
+`.map_reduce`.
+
+That tibble is then passed as the **single argument** to `.finalize`. In the
+example below,
+
+```r
+.finalize = function(partials) {
+  partials |>
+    ...
+}
+```
+
+`function(partials) { ... }` is simply an **anonymous R function**. The name
+`partials` has no special meaning: it could just as well be called `x`, `state`,
+or anything else. What matters is that the function receives the compact tibble
+produced by the Arrow reduction step.
+
+Conceptually, `summarise_big()` does something like:
+
+```r
+partials <- arrow_reduction |> collect()
+result <- .finalize(partials)
+```
+
+The finalizer therefore works on the compact table of sufficient statistics,
+not on the original raw observations. It must return a data frame or tibble.
+
 ```r
 regression_mr <- summarise_big(
   ds,
@@ -171,8 +203,8 @@ regression_mr <- summarise_big(
     sum_y2 = ~ sum(y * y),
     sum_xy = ~ sum(x * y)
   ),
-  .finalize = function(state) {
-    state |>
+  .finalize = function(partials) {
+    partials |>
       mutate(
         centered_xx = sum_x2 - sum_x^2 / n,
         centered_yy = sum_y2 - sum_y^2 / n,
@@ -289,8 +321,8 @@ mr <- summarise_big(
     n = ~ dplyr::n(),
     sum_x = ~ sum(x)
   ),
-  .finalize = function(state) {
-    state |>
+  .finalize = function(partials) {
+    partials |>
       mutate(mean_x = sum_x / n) |>
       select(grp, mean_x)
   }
