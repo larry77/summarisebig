@@ -426,75 +426,406 @@ summarise_big(
 )
 ```
 
-## Performance: more workers are not automatically better
+## Reproducible performance experiments
 
-The development benchmarks produced a consistent qualitative lesson:
+Performance depends on hardware, storage, group sizes, and—most
+importantly—on what the summary function actually does. Rather than
+treating “large data” or “non-trivial functions” as abstract categories,
+the examples below show the exact functions being timed.
 
-1.  **Use native Arrow whenever possible.** It avoids raw-data
-    materialization and parallel-worker overhead.
-2.  **If a compact sufficient-statistics decomposition exists, MapReduce
-    is usually the next-best route.** The large-data reduction still
-    happens in Arrow.
-3.  **Materialize raw groups only when necessary.** Parallelism helps
-    only when the per-group R work is expensive enough to repay its
-    overhead.
+The snippets are deliberately small enough to run on an ordinary
+machine. If a run is too short to measure meaningfully, increase
+`rows_per_group` or, for the CPU-heavy example, `cpu_reps`. The timing
+numbers reported after the snippets come from the larger development
+benchmark suite and are **illustrative, not performance guarantees**.
 
-Some illustrative results from the development benchmark suite are
-below. They are machine- and workload-specific and should not be
-interpreted as universal performance guarantees.
+A fresh benchmark dataset can be created as follows:
 
-### Arrow and MapReduce avoid expensive materialization
+``` r
 
-For a native Arrow workload, direct Arrow took about **1.76 s**, while
+set.seed(1)
+
+n_groups <- 100L
+rows_per_group <- 5000L
+n <- n_groups * rows_per_group
+
+bench_dat <- data.frame(
+  grp = rep(seq_len(n_groups), each = rows_per_group),
+  x = stats::rnorm(n)
+)
+
+bench_dat$y <- 0.7 * bench_dat$x + stats::rnorm(n)
+
+bench_path <- tempfile("summarisebig-benchmark-")
+write_dataset(bench_dat, bench_path, format = "parquet")
+bench_ds <- open_dataset(bench_path)
+```
+
+A tiny helper keeps both the result and elapsed time:
+
+``` r
+
+time_run <- function(expr) {
+  timing <- system.time(value <- force(expr))
+
+  list(
+    value = value,
+    elapsed = unname(timing[["elapsed"]])
+  )
+}
+
+same_result <- function(a, b, tolerance = 1e-8) {
+  a <- as.data.frame(arrange(a, grp))
+  b <- as.data.frame(arrange(b, grp))
+
+  isTRUE(
+    all.equal(
+      a,
+      b,
+      tolerance = tolerance,
+      check.attributes = FALSE
+    )
+  )
+}
+```
+
+### Experiment 1: do not parallelize work Arrow can already do
+
+Start with an ordinary grouped mean. Arrow can compute this directly, so
+there is no reason to materialize raw groups merely to use R workers.
+
+``` r
+
+direct_arrow <- time_run(
+  bench_ds |>
+    summarise(mean_x = mean(x), .by = grp) |>
+    collect()
+)
+
+summarisebig_arrow <- time_run(
+  summarise_big(
+    bench_ds,
+    mean_x = mean(x),
+    .by = grp
+  )
+)
+
+forced_materialization <- time_run(
+  summarise_big(
+    bench_ds,
+    mean_x = mean(x),
+    .by = grp,
+    .strategy = "parallel_chunks",
+    .workers = 1,
+    .chunk_rows = 100000,
+    .try_arrow = FALSE
+  )
+)
+
+stopifnot(
+  same_result(direct_arrow$value, summarisebig_arrow$value),
+  same_result(direct_arrow$value, forced_materialization$value)
+)
+
+data.frame(
+  method = c(
+    "direct Arrow",
+    "summarise_big Arrow fast path",
+    "forced R materialization"
+  ),
+  elapsed = c(
+    direct_arrow$elapsed,
+    summarisebig_arrow$elapsed,
+    forced_materialization$elapsed
+  )
+)
+```
+
+`.try_arrow = FALSE` is used here **only for benchmarking**. In normal
+use it would be counterproductive for a summary such as
+[`mean()`](https://rdrr.io/r/base/mean.html).
+
+In the development benchmark, direct Arrow took about **1.76 s** and the
 [`summarise_big()`](https://larry77.github.io/summarisebig/reference/summarise_big.md)
-using its automatic Arrow fast path took about **2.22 s**.
+Arrow fast path about **2.22 s**. The precise difference is
+machine-specific; the important point is that both avoid raw-group
+materialization entirely.
 
-For decomposable statistics, MapReduce was substantially faster than
-raw-group materialization in the benchmark runs:
+### Experiment 2: MapReduce versus fitting `lm()` inside every group
 
-| Statistic | MapReduce | 1-worker `parallel_chunks` |
-|----|---:|---:|
-| Skew-style sufficient-statistic calculation | 2.31 s | 4.48 s |
-| Regression slope from sufficient statistics | 2.20 s | 6.55 s |
+The earlier regression example can also be turned into a benchmark. Here
+the ordinary-R version actually fits a separate model for every group
+and extracts the slope p-value:
 
-The point is not that MapReduce is always a particular number of times
-faster. The important distinction is architectural: it transfers a few
-numbers per group to R instead of transferring the raw observations.
+``` r
 
-### Parallelism helps expensive R work
+lm_p_value <- function(x, y) {
+  fit <- summary(stats::lm(y ~ x))
+  unname(fit$coefficients[2, 4])
+}
+```
 
-On a deliberately CPU-heavy 10-million-row workload:
+The MapReduce version instead asks Arrow only for sufficient statistics
+and lets R perform the small final inference calculation:
+
+``` r
+
+map_reduce_lm <- time_run(
+  summarise_big(
+    bench_ds,
+    .by = grp,
+    .strategy = "map_reduce",
+    .map_reduce = list(
+      n = ~ dplyr::n(),
+      sum_x = ~ sum(x),
+      sum_y = ~ sum(y),
+      sum_x2 = ~ sum(x * x),
+      sum_y2 = ~ sum(y * y),
+      sum_xy = ~ sum(x * y)
+    ),
+    .finalize = function(partials) {
+      partials |>
+        mutate(
+          centered_xx = sum_x2 - sum_x^2 / n,
+          centered_yy = sum_y2 - sum_y^2 / n,
+          centered_xy = sum_xy - sum_x * sum_y / n,
+          slope = centered_xy / centered_xx,
+          residual_ss = centered_yy - slope * centered_xy,
+          slope_se = sqrt((residual_ss / (n - 2)) / centered_xx),
+          t_value = slope / slope_se,
+          result = 2 * stats::pt(-abs(t_value), df = n - 2)
+        ) |>
+        select(grp, result)
+    }
+  )
+)
+
+raw_lm <- time_run(
+  summarise_big(
+    bench_ds,
+    result = lm_p_value(x, y),
+    .by = grp,
+    .strategy = "parallel_chunks",
+    .workers = 1,
+    .chunk_rows = 100000,
+    .try_arrow = FALSE
+  )
+)
+
+stopifnot(
+  same_result(map_reduce_lm$value, raw_lm$value, tolerance = 1e-7)
+)
+
+data.frame(
+  method = c("MapReduce", "per-group lm()"),
+  elapsed = c(map_reduce_lm$elapsed, raw_lm$elapsed)
+)
+```
+
+This is the central reason for the MapReduce route: the R finalizer
+receives only one compact row of partial statistics per group rather
+than all original observations.
+
+The development suite used the closely related regression **slope**
+calculation with the same sufficient-statistics idea. It took about
+**2.20 s** with MapReduce versus **6.55 s** for one-worker raw-group
+materialization with [`lm()`](https://rdrr.io/r/stats/lm.html). The
+exact p-value example above is intentionally more demanding of the R
+finalizer than the slope-only benchmark.
+
+### Experiment 3: a cheap custom R function can become slower with more workers
+
+This was the lightweight function used in the development benchmark:
+
+``` r
+
+custom_light <- function(x, y) {
+  mean((x - y)^2 + abs(x), na.rm = TRUE)
+}
+```
+
+We can time the same calculation at different worker counts. The helper
+below also verifies that changing the worker count does not change the
+result.
+
+``` r
+
+benchmark_workers <- function(fun, strategy) {
+  workers <- c(1L, 2L, 4L)
+
+  runs <- lapply(workers, function(w) {
+    time_run(
+      summarise_big(
+        bench_ds,
+        result = fun(x, y),
+        .by = grp,
+        .strategy = strategy,
+        .workers = w,
+        .chunk_rows = 100000,
+        .task_rows = 25000,
+        .try_arrow = FALSE
+      )
+    )
+  })
+
+  reference <- runs[[1]]$value
+
+  stopifnot(
+    all(vapply(
+      runs[-1],
+      function(run) same_result(reference, run$value),
+      logical(1)
+    ))
+  )
+
+  data.frame(
+    strategy = strategy,
+    workers = workers,
+    elapsed = vapply(runs, function(run) run$elapsed, numeric(1))
+  )
+}
+
+benchmark_workers(custom_light, "parallel_chunks")
+
+if (requireNamespace("mori", quietly = TRUE)) {
+  benchmark_workers(custom_light, "shared_chunk")
+}
+```
+
+On the larger development benchmark, the exact same `custom_light()`
+function produced:
+
+| Strategy          | 1 worker | 2 workers | 4 workers |
+|-------------------|---------:|----------:|----------:|
+| `parallel_chunks` |   4.90 s |    6.48 s |    6.49 s |
+| `shared_chunk`    |   8.45 s |   11.58 s |   11.77 s |
+
+Nothing is wrong with the parallel machinery here: the useful R work is
+simply too cheap. Worker startup, future scheduling, Parquet I/O, task
+construction, serialization, and result combination cost more than the
+parallelism saves.
+
+### Experiment 4: give the workers enough CPU work and parallelism can pay
+
+To test actual CPU scaling, the development suite used this
+deterministic function:
+
+``` r
+
+custom_cpu <- function(x, y, reps = 25L) {
+  z <- x - y
+  acc <- 0
+
+  for (k in seq_len(reps)) {
+    a <- k / (reps + 1)
+
+    acc <- acc + mean(
+      sin(z * (1 + a))^2 +
+        cos((x + y) / (1 + a))^2 +
+        log1p(abs(z * a)),
+      na.rm = TRUE
+    )
+  }
+
+  acc / reps
+}
+```
+
+You can run exactly the same worker-count experiment:
+
+``` r
+
+cpu_reps <- 25L
+
+custom_cpu_benchmark <- function(x, y) {
+  custom_cpu(x, y, reps = cpu_reps)
+}
+
+benchmark_workers(custom_cpu_benchmark, "parallel_chunks")
+
+if (requireNamespace("mori", quietly = TRUE)) {
+  benchmark_workers(custom_cpu_benchmark, "shared_chunk")
+}
+```
+
+If these runs are still too short on your machine, increase `cpu_reps`
+rather than assuming that adding workers must help.
+
+With this exact function and `reps = 25`, the larger development run
+produced:
 
 | Strategy          | 1 worker | 2 workers | 4 workers |
 |-------------------|---------:|----------:|----------:|
 | `parallel_chunks` |  26.79 s |   17.86 s |   12.48 s |
 | `shared_chunk`    |  30.04 s |   24.43 s |   19.51 s |
 
-Here the R computation was expensive enough that worker parallelism paid
-for itself. `parallel_chunks` reached about a **2.15x** speedup at four
-workers in this run; `shared_chunk` reached about **1.54x**.
+Here there is enough ordinary-R computation to amortize the parallel
+overhead. `parallel_chunks` achieved about a **2.15x** speedup from one
+to four workers in that run, while `shared_chunk` achieved about
+**1.54x**.
 
-### Cheap functions can get slower with more workers
+The two strategies optimize different things: `parallel_chunks` is
+generally the throughput-oriented choice, while `shared_chunk` is
+designed to reduce simultaneous private copies of a materialized chunk.
 
-For lightweight custom summaries, extra workers did not help. In one
-benchmark, `parallel_chunks` took approximately **4.90 s** with one
-worker and **6.48 s** with two workers. `shared_chunk` showed the same
-general effect.
+### Experiment 5: even a substantial raw-data calculation need not scale
 
-An exact-quantile workload also failed to benefit from more workers:
+Exact quantiles are a useful counterexample because they require the raw
+group values and sorting work, but the overall workload can still be
+dominated by materialization and coordination costs.
+
+The development benchmark used:
+
+``` r
+
+custom_quantile <- function(x, y) {
+  z <- (x - y)^2 + sin(x) + log1p(abs(y))
+
+  qs <- stats::quantile(
+    z,
+    probs = c(0.10, 0.50, 0.90, 0.99),
+    na.rm = TRUE,
+    names = FALSE,
+    type = 7
+  )
+
+  qs[[4L]] - qs[[1L]] + qs[[3L]] - qs[[2L]]
+}
+```
+
+``` r
+
+benchmark_workers(custom_quantile, "parallel_chunks")
+
+if (requireNamespace("mori", quietly = TRUE)) {
+  benchmark_workers(custom_quantile, "shared_chunk")
+}
+```
+
+The corresponding development timings were:
 
 | Strategy          | 1 worker | 2 workers | 4 workers |
 |-------------------|---------:|----------:|----------:|
 | `parallel_chunks` |   5.49 s |    6.13 s |    6.33 s |
 | `shared_chunk`    |   8.39 s |   13.54 s |   13.35 s |
 
-Parallel execution has real costs: worker startup, scheduling, future
-creation, Parquet I/O, task construction, serialization, and result
-combination. If the summary itself is cheap, those costs can dominate.
+So the practical rule is not “use more workers for difficult functions”.
+It is: **benchmark the actual function, group structure, and storage
+layout that matter to your analysis.**
 
-So `.workers = 2` is a conservative default, not a claim that two
-workers are always faster than one. Benchmark the workload that matters
-to you.
+Taken together, the experiments support the package’s execution
+hierarchy:
+
+1.  **Native Arrow first** when it can express the complete grouped
+    result.
+2.  **MapReduce next** when compact Arrow-computable partial statistics
+    are sufficient and only a small final calculation needs R.
+3.  **Raw-group materialization last**, using `parallel_chunks` or
+    `shared_chunk` when the statistic genuinely requires the
+    observations themselves.
+
+Parallelism is an optimization *within* the third case, not a substitute
+for avoiding materialization in the first place.
 
 ## Choosing a strategy
 

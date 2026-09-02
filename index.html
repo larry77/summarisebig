@@ -340,49 +340,279 @@ Does arbitrary R need the raw observations?
 <span><span class="op">)</span></span></code></pre></div>
 </div>
 <div class="section level2">
-<h2 id="performance-more-workers-are-not-automatically-better">Performance: more workers are not automatically better<a class="anchor" aria-label="anchor" href="#performance-more-workers-are-not-automatically-better"></a>
+<h2 id="reproducible-performance-experiments">Reproducible performance experiments<a class="anchor" aria-label="anchor" href="#reproducible-performance-experiments"></a>
 </h2>
-<p>The development benchmarks produced a consistent qualitative lesson:</p>
-<ol style="list-style-type: decimal">
-<li>
-<strong>Use native Arrow whenever possible.</strong> It avoids raw-data materialization and parallel-worker overhead.</li>
-<li>
-<strong>If a compact sufficient-statistics decomposition exists, MapReduce is usually the next-best route.</strong> The large-data reduction still happens in Arrow.</li>
-<li>
-<strong>Materialize raw groups only when necessary.</strong> Parallelism helps only when the per-group R work is expensive enough to repay its overhead.</li>
-</ol>
-<p>Some illustrative results from the development benchmark suite are below. They are machine- and workload-specific and should not be interpreted as universal performance guarantees.</p>
+<p>Performance depends on hardware, storage, group sizes, and—most importantly—on what the summary function actually does. Rather than treating “large data” or “non-trivial functions” as abstract categories, the examples below show the exact functions being timed.</p>
+<p>The snippets are deliberately small enough to run on an ordinary machine. If a run is too short to measure meaningfully, increase <code>rows_per_group</code> or, for the CPU-heavy example, <code>cpu_reps</code>. The timing numbers reported after the snippets come from the larger development benchmark suite and are <strong>illustrative, not performance guarantees</strong>.</p>
+<p>A fresh benchmark dataset can be created as follows:</p>
+<div class="sourceCode" id="cb14"><pre class="downlit sourceCode r">
+<code class="sourceCode R"><span><span class="fu"><a href="https://rdrr.io/r/base/Random.html" class="external-link">set.seed</a></span><span class="op">(</span><span class="fl">1</span><span class="op">)</span></span>
+<span></span>
+<span><span class="va">n_groups</span> <span class="op">&lt;-</span> <span class="fl">100L</span></span>
+<span><span class="va">rows_per_group</span> <span class="op">&lt;-</span> <span class="fl">5000L</span></span>
+<span><span class="va">n</span> <span class="op">&lt;-</span> <span class="va">n_groups</span> <span class="op">*</span> <span class="va">rows_per_group</span></span>
+<span></span>
+<span><span class="va">bench_dat</span> <span class="op">&lt;-</span> <span class="fu"><a href="https://rdrr.io/r/base/data.frame.html" class="external-link">data.frame</a></span><span class="op">(</span></span>
+<span>  grp <span class="op">=</span> <span class="fu"><a href="https://rdrr.io/r/base/rep.html" class="external-link">rep</a></span><span class="op">(</span><span class="fu"><a href="https://rdrr.io/r/base/seq.html" class="external-link">seq_len</a></span><span class="op">(</span><span class="va">n_groups</span><span class="op">)</span>, each <span class="op">=</span> <span class="va">rows_per_group</span><span class="op">)</span>,</span>
+<span>  x <span class="op">=</span> <span class="fu">stats</span><span class="fu">::</span><span class="fu"><a href="https://rdrr.io/r/stats/Normal.html" class="external-link">rnorm</a></span><span class="op">(</span><span class="va">n</span><span class="op">)</span></span>
+<span><span class="op">)</span></span>
+<span></span>
+<span><span class="va">bench_dat</span><span class="op">$</span><span class="va">y</span> <span class="op">&lt;-</span> <span class="fl">0.7</span> <span class="op">*</span> <span class="va">bench_dat</span><span class="op">$</span><span class="va">x</span> <span class="op">+</span> <span class="fu">stats</span><span class="fu">::</span><span class="fu"><a href="https://rdrr.io/r/stats/Normal.html" class="external-link">rnorm</a></span><span class="op">(</span><span class="va">n</span><span class="op">)</span></span>
+<span></span>
+<span><span class="va">bench_path</span> <span class="op">&lt;-</span> <span class="fu"><a href="https://rdrr.io/r/base/tempfile.html" class="external-link">tempfile</a></span><span class="op">(</span><span class="st">"summarisebig-benchmark-"</span><span class="op">)</span></span>
+<span><span class="fu"><a href="https://arrow.apache.org/docs/r/reference/write_dataset.html" class="external-link">write_dataset</a></span><span class="op">(</span><span class="va">bench_dat</span>, <span class="va">bench_path</span>, format <span class="op">=</span> <span class="st">"parquet"</span><span class="op">)</span></span>
+<span><span class="va">bench_ds</span> <span class="op">&lt;-</span> <span class="fu"><a href="https://arrow.apache.org/docs/r/reference/open_dataset.html" class="external-link">open_dataset</a></span><span class="op">(</span><span class="va">bench_path</span><span class="op">)</span></span></code></pre></div>
+<p>A tiny helper keeps both the result and elapsed time:</p>
+<div class="sourceCode" id="cb15"><pre class="downlit sourceCode r">
+<code class="sourceCode R"><span><span class="va">time_run</span> <span class="op">&lt;-</span> <span class="kw">function</span><span class="op">(</span><span class="va">expr</span><span class="op">)</span> <span class="op">{</span></span>
+<span>  <span class="va">timing</span> <span class="op">&lt;-</span> <span class="fu"><a href="https://rdrr.io/r/base/system.time.html" class="external-link">system.time</a></span><span class="op">(</span><span class="va">value</span> <span class="op">&lt;-</span> <span class="fu"><a href="https://rdrr.io/r/base/force.html" class="external-link">force</a></span><span class="op">(</span><span class="va">expr</span><span class="op">)</span><span class="op">)</span></span>
+<span></span>
+<span>  <span class="fu"><a href="https://rdrr.io/r/base/list.html" class="external-link">list</a></span><span class="op">(</span></span>
+<span>    value <span class="op">=</span> <span class="va">value</span>,</span>
+<span>    elapsed <span class="op">=</span> <span class="fu"><a href="https://rdrr.io/r/base/unname.html" class="external-link">unname</a></span><span class="op">(</span><span class="va">timing</span><span class="op">[[</span><span class="st">"elapsed"</span><span class="op">]</span><span class="op">]</span><span class="op">)</span></span>
+<span>  <span class="op">)</span></span>
+<span><span class="op">}</span></span>
+<span></span>
+<span><span class="va">same_result</span> <span class="op">&lt;-</span> <span class="kw">function</span><span class="op">(</span><span class="va">a</span>, <span class="va">b</span>, <span class="va">tolerance</span> <span class="op">=</span> <span class="fl">1e-8</span><span class="op">)</span> <span class="op">{</span></span>
+<span>  <span class="va">a</span> <span class="op">&lt;-</span> <span class="fu"><a href="https://rdrr.io/r/base/as.data.frame.html" class="external-link">as.data.frame</a></span><span class="op">(</span><span class="fu"><a href="https://dplyr.tidyverse.org/reference/arrange.html" class="external-link">arrange</a></span><span class="op">(</span><span class="va">a</span>, <span class="va">grp</span><span class="op">)</span><span class="op">)</span></span>
+<span>  <span class="va">b</span> <span class="op">&lt;-</span> <span class="fu"><a href="https://rdrr.io/r/base/as.data.frame.html" class="external-link">as.data.frame</a></span><span class="op">(</span><span class="fu"><a href="https://dplyr.tidyverse.org/reference/arrange.html" class="external-link">arrange</a></span><span class="op">(</span><span class="va">b</span>, <span class="va">grp</span><span class="op">)</span><span class="op">)</span></span>
+<span></span>
+<span>  <span class="fu"><a href="https://rdrr.io/r/base/Logic.html" class="external-link">isTRUE</a></span><span class="op">(</span></span>
+<span>    <span class="fu"><a href="https://rdrr.io/r/base/all.equal.html" class="external-link">all.equal</a></span><span class="op">(</span></span>
+<span>      <span class="va">a</span>,</span>
+<span>      <span class="va">b</span>,</span>
+<span>      tolerance <span class="op">=</span> <span class="va">tolerance</span>,</span>
+<span>      check.attributes <span class="op">=</span> <span class="cn">FALSE</span></span>
+<span>    <span class="op">)</span></span>
+<span>  <span class="op">)</span></span>
+<span><span class="op">}</span></span></code></pre></div>
 <div class="section level3">
-<h3 id="arrow-and-mapreduce-avoid-expensive-materialization">Arrow and MapReduce avoid expensive materialization<a class="anchor" aria-label="anchor" href="#arrow-and-mapreduce-avoid-expensive-materialization"></a>
+<h3 id="experiment-1-do-not-parallelize-work-arrow-can-already-do">Experiment 1: do not parallelize work Arrow can already do<a class="anchor" aria-label="anchor" href="#experiment-1-do-not-parallelize-work-arrow-can-already-do"></a>
 </h3>
-<p>For a native Arrow workload, direct Arrow took about <strong>1.76 s</strong>, while <code><a href="reference/summarise_big.html">summarise_big()</a></code> using its automatic Arrow fast path took about <strong>2.22 s</strong>.</p>
-<p>For decomposable statistics, MapReduce was substantially faster than raw-group materialization in the benchmark runs:</p>
+<p>Start with an ordinary grouped mean. Arrow can compute this directly, so there is no reason to materialize raw groups merely to use R workers.</p>
+<div class="sourceCode" id="cb16"><pre class="downlit sourceCode r">
+<code class="sourceCode R"><span><span class="va">direct_arrow</span> <span class="op">&lt;-</span> <span class="fu">time_run</span><span class="op">(</span></span>
+<span>  <span class="va">bench_ds</span> <span class="op">|&gt;</span></span>
+<span>    <span class="fu"><a href="https://dplyr.tidyverse.org/reference/summarise.html" class="external-link">summarise</a></span><span class="op">(</span>mean_x <span class="op">=</span> <span class="fu"><a href="https://rdrr.io/r/base/mean.html" class="external-link">mean</a></span><span class="op">(</span><span class="va">x</span><span class="op">)</span>, .by <span class="op">=</span> <span class="va">grp</span><span class="op">)</span> <span class="op">|&gt;</span></span>
+<span>    <span class="fu"><a href="https://dplyr.tidyverse.org/reference/compute.html" class="external-link">collect</a></span><span class="op">(</span><span class="op">)</span></span>
+<span><span class="op">)</span></span>
+<span></span>
+<span><span class="va">summarisebig_arrow</span> <span class="op">&lt;-</span> <span class="fu">time_run</span><span class="op">(</span></span>
+<span>  <span class="fu"><a href="reference/summarise_big.html">summarise_big</a></span><span class="op">(</span></span>
+<span>    <span class="va">bench_ds</span>,</span>
+<span>    mean_x <span class="op">=</span> <span class="fu"><a href="https://rdrr.io/r/base/mean.html" class="external-link">mean</a></span><span class="op">(</span><span class="va">x</span><span class="op">)</span>,</span>
+<span>    .by <span class="op">=</span> <span class="va">grp</span></span>
+<span>  <span class="op">)</span></span>
+<span><span class="op">)</span></span>
+<span></span>
+<span><span class="va">forced_materialization</span> <span class="op">&lt;-</span> <span class="fu">time_run</span><span class="op">(</span></span>
+<span>  <span class="fu"><a href="reference/summarise_big.html">summarise_big</a></span><span class="op">(</span></span>
+<span>    <span class="va">bench_ds</span>,</span>
+<span>    mean_x <span class="op">=</span> <span class="fu"><a href="https://rdrr.io/r/base/mean.html" class="external-link">mean</a></span><span class="op">(</span><span class="va">x</span><span class="op">)</span>,</span>
+<span>    .by <span class="op">=</span> <span class="va">grp</span>,</span>
+<span>    .strategy <span class="op">=</span> <span class="st">"parallel_chunks"</span>,</span>
+<span>    .workers <span class="op">=</span> <span class="fl">1</span>,</span>
+<span>    .chunk_rows <span class="op">=</span> <span class="fl">100000</span>,</span>
+<span>    .try_arrow <span class="op">=</span> <span class="cn">FALSE</span></span>
+<span>  <span class="op">)</span></span>
+<span><span class="op">)</span></span>
+<span></span>
+<span><span class="fu"><a href="https://rdrr.io/r/base/stopifnot.html" class="external-link">stopifnot</a></span><span class="op">(</span></span>
+<span>  <span class="fu">same_result</span><span class="op">(</span><span class="va">direct_arrow</span><span class="op">$</span><span class="va">value</span>, <span class="va">summarisebig_arrow</span><span class="op">$</span><span class="va">value</span><span class="op">)</span>,</span>
+<span>  <span class="fu">same_result</span><span class="op">(</span><span class="va">direct_arrow</span><span class="op">$</span><span class="va">value</span>, <span class="va">forced_materialization</span><span class="op">$</span><span class="va">value</span><span class="op">)</span></span>
+<span><span class="op">)</span></span>
+<span></span>
+<span><span class="fu"><a href="https://rdrr.io/r/base/data.frame.html" class="external-link">data.frame</a></span><span class="op">(</span></span>
+<span>  method <span class="op">=</span> <span class="fu"><a href="https://rdrr.io/r/base/c.html" class="external-link">c</a></span><span class="op">(</span></span>
+<span>    <span class="st">"direct Arrow"</span>,</span>
+<span>    <span class="st">"summarise_big Arrow fast path"</span>,</span>
+<span>    <span class="st">"forced R materialization"</span></span>
+<span>  <span class="op">)</span>,</span>
+<span>  elapsed <span class="op">=</span> <span class="fu"><a href="https://rdrr.io/r/base/c.html" class="external-link">c</a></span><span class="op">(</span></span>
+<span>    <span class="va">direct_arrow</span><span class="op">$</span><span class="va">elapsed</span>,</span>
+<span>    <span class="va">summarisebig_arrow</span><span class="op">$</span><span class="va">elapsed</span>,</span>
+<span>    <span class="va">forced_materialization</span><span class="op">$</span><span class="va">elapsed</span></span>
+<span>  <span class="op">)</span></span>
+<span><span class="op">)</span></span></code></pre></div>
+<p><code>.try_arrow = FALSE</code> is used here <strong>only for benchmarking</strong>. In normal use it would be counterproductive for a summary such as <code><a href="https://rdrr.io/r/base/mean.html" class="external-link">mean()</a></code>.</p>
+<p>In the development benchmark, direct Arrow took about <strong>1.76 s</strong> and the <code><a href="reference/summarise_big.html">summarise_big()</a></code> Arrow fast path about <strong>2.22 s</strong>. The precise difference is machine-specific; the important point is that both avoid raw-group materialization entirely.</p>
+</div>
+<div class="section level3">
+<h3 id="experiment-2-mapreduce-versus-fitting-lm-inside-every-group">Experiment 2: MapReduce versus fitting <code>lm()</code> inside every group<a class="anchor" aria-label="anchor" href="#experiment-2-mapreduce-versus-fitting-lm-inside-every-group"></a>
+</h3>
+<p>The earlier regression example can also be turned into a benchmark. Here the ordinary-R version actually fits a separate model for every group and extracts the slope p-value:</p>
+<div class="sourceCode" id="cb17"><pre class="downlit sourceCode r">
+<code class="sourceCode R"><span><span class="va">lm_p_value</span> <span class="op">&lt;-</span> <span class="kw">function</span><span class="op">(</span><span class="va">x</span>, <span class="va">y</span><span class="op">)</span> <span class="op">{</span></span>
+<span>  <span class="va">fit</span> <span class="op">&lt;-</span> <span class="fu"><a href="https://rdrr.io/r/base/summary.html" class="external-link">summary</a></span><span class="op">(</span><span class="fu">stats</span><span class="fu">::</span><span class="fu"><a href="https://rdrr.io/r/stats/lm.html" class="external-link">lm</a></span><span class="op">(</span><span class="va">y</span> <span class="op">~</span> <span class="va">x</span><span class="op">)</span><span class="op">)</span></span>
+<span>  <span class="fu"><a href="https://rdrr.io/r/base/unname.html" class="external-link">unname</a></span><span class="op">(</span><span class="va">fit</span><span class="op">$</span><span class="va">coefficients</span><span class="op">[</span><span class="fl">2</span>, <span class="fl">4</span><span class="op">]</span><span class="op">)</span></span>
+<span><span class="op">}</span></span></code></pre></div>
+<p>The MapReduce version instead asks Arrow only for sufficient statistics and lets R perform the small final inference calculation:</p>
+<div class="sourceCode" id="cb18"><pre class="downlit sourceCode r">
+<code class="sourceCode R"><span><span class="va">map_reduce_lm</span> <span class="op">&lt;-</span> <span class="fu">time_run</span><span class="op">(</span></span>
+<span>  <span class="fu"><a href="reference/summarise_big.html">summarise_big</a></span><span class="op">(</span></span>
+<span>    <span class="va">bench_ds</span>,</span>
+<span>    .by <span class="op">=</span> <span class="va">grp</span>,</span>
+<span>    .strategy <span class="op">=</span> <span class="st">"map_reduce"</span>,</span>
+<span>    .map_reduce <span class="op">=</span> <span class="fu"><a href="https://rdrr.io/r/base/list.html" class="external-link">list</a></span><span class="op">(</span></span>
+<span>      n <span class="op">=</span> <span class="op">~</span> <span class="fu">dplyr</span><span class="fu">::</span><span class="fu"><a href="https://dplyr.tidyverse.org/reference/context.html" class="external-link">n</a></span><span class="op">(</span><span class="op">)</span>,</span>
+<span>      sum_x <span class="op">=</span> <span class="op">~</span> <span class="fu"><a href="https://rdrr.io/r/base/sum.html" class="external-link">sum</a></span><span class="op">(</span><span class="va">x</span><span class="op">)</span>,</span>
+<span>      sum_y <span class="op">=</span> <span class="op">~</span> <span class="fu"><a href="https://rdrr.io/r/base/sum.html" class="external-link">sum</a></span><span class="op">(</span><span class="va">y</span><span class="op">)</span>,</span>
+<span>      sum_x2 <span class="op">=</span> <span class="op">~</span> <span class="fu"><a href="https://rdrr.io/r/base/sum.html" class="external-link">sum</a></span><span class="op">(</span><span class="va">x</span> <span class="op">*</span> <span class="va">x</span><span class="op">)</span>,</span>
+<span>      sum_y2 <span class="op">=</span> <span class="op">~</span> <span class="fu"><a href="https://rdrr.io/r/base/sum.html" class="external-link">sum</a></span><span class="op">(</span><span class="va">y</span> <span class="op">*</span> <span class="va">y</span><span class="op">)</span>,</span>
+<span>      sum_xy <span class="op">=</span> <span class="op">~</span> <span class="fu"><a href="https://rdrr.io/r/base/sum.html" class="external-link">sum</a></span><span class="op">(</span><span class="va">x</span> <span class="op">*</span> <span class="va">y</span><span class="op">)</span></span>
+<span>    <span class="op">)</span>,</span>
+<span>    .finalize <span class="op">=</span> <span class="kw">function</span><span class="op">(</span><span class="va">partials</span><span class="op">)</span> <span class="op">{</span></span>
+<span>      <span class="va">partials</span> <span class="op">|&gt;</span></span>
+<span>        <span class="fu"><a href="https://dplyr.tidyverse.org/reference/mutate.html" class="external-link">mutate</a></span><span class="op">(</span></span>
+<span>          centered_xx <span class="op">=</span> <span class="va">sum_x2</span> <span class="op">-</span> <span class="va">sum_x</span><span class="op">^</span><span class="fl">2</span> <span class="op">/</span> <span class="va">n</span>,</span>
+<span>          centered_yy <span class="op">=</span> <span class="va">sum_y2</span> <span class="op">-</span> <span class="va">sum_y</span><span class="op">^</span><span class="fl">2</span> <span class="op">/</span> <span class="va">n</span>,</span>
+<span>          centered_xy <span class="op">=</span> <span class="va">sum_xy</span> <span class="op">-</span> <span class="va">sum_x</span> <span class="op">*</span> <span class="va">sum_y</span> <span class="op">/</span> <span class="va">n</span>,</span>
+<span>          slope <span class="op">=</span> <span class="va">centered_xy</span> <span class="op">/</span> <span class="va">centered_xx</span>,</span>
+<span>          residual_ss <span class="op">=</span> <span class="va">centered_yy</span> <span class="op">-</span> <span class="va">slope</span> <span class="op">*</span> <span class="va">centered_xy</span>,</span>
+<span>          slope_se <span class="op">=</span> <span class="fu"><a href="https://rdrr.io/r/base/MathFun.html" class="external-link">sqrt</a></span><span class="op">(</span><span class="op">(</span><span class="va">residual_ss</span> <span class="op">/</span> <span class="op">(</span><span class="va">n</span> <span class="op">-</span> <span class="fl">2</span><span class="op">)</span><span class="op">)</span> <span class="op">/</span> <span class="va">centered_xx</span><span class="op">)</span>,</span>
+<span>          t_value <span class="op">=</span> <span class="va">slope</span> <span class="op">/</span> <span class="va">slope_se</span>,</span>
+<span>          result <span class="op">=</span> <span class="fl">2</span> <span class="op">*</span> <span class="fu">stats</span><span class="fu">::</span><span class="fu"><a href="https://rdrr.io/r/stats/TDist.html" class="external-link">pt</a></span><span class="op">(</span><span class="op">-</span><span class="fu"><a href="https://rdrr.io/r/base/MathFun.html" class="external-link">abs</a></span><span class="op">(</span><span class="va">t_value</span><span class="op">)</span>, df <span class="op">=</span> <span class="va">n</span> <span class="op">-</span> <span class="fl">2</span><span class="op">)</span></span>
+<span>        <span class="op">)</span> <span class="op">|&gt;</span></span>
+<span>        <span class="fu"><a href="https://dplyr.tidyverse.org/reference/select.html" class="external-link">select</a></span><span class="op">(</span><span class="va">grp</span>, <span class="va">result</span><span class="op">)</span></span>
+<span>    <span class="op">}</span></span>
+<span>  <span class="op">)</span></span>
+<span><span class="op">)</span></span>
+<span></span>
+<span><span class="va">raw_lm</span> <span class="op">&lt;-</span> <span class="fu">time_run</span><span class="op">(</span></span>
+<span>  <span class="fu"><a href="reference/summarise_big.html">summarise_big</a></span><span class="op">(</span></span>
+<span>    <span class="va">bench_ds</span>,</span>
+<span>    result <span class="op">=</span> <span class="fu">lm_p_value</span><span class="op">(</span><span class="va">x</span>, <span class="va">y</span><span class="op">)</span>,</span>
+<span>    .by <span class="op">=</span> <span class="va">grp</span>,</span>
+<span>    .strategy <span class="op">=</span> <span class="st">"parallel_chunks"</span>,</span>
+<span>    .workers <span class="op">=</span> <span class="fl">1</span>,</span>
+<span>    .chunk_rows <span class="op">=</span> <span class="fl">100000</span>,</span>
+<span>    .try_arrow <span class="op">=</span> <span class="cn">FALSE</span></span>
+<span>  <span class="op">)</span></span>
+<span><span class="op">)</span></span>
+<span></span>
+<span><span class="fu"><a href="https://rdrr.io/r/base/stopifnot.html" class="external-link">stopifnot</a></span><span class="op">(</span></span>
+<span>  <span class="fu">same_result</span><span class="op">(</span><span class="va">map_reduce_lm</span><span class="op">$</span><span class="va">value</span>, <span class="va">raw_lm</span><span class="op">$</span><span class="va">value</span>, tolerance <span class="op">=</span> <span class="fl">1e-7</span><span class="op">)</span></span>
+<span><span class="op">)</span></span>
+<span></span>
+<span><span class="fu"><a href="https://rdrr.io/r/base/data.frame.html" class="external-link">data.frame</a></span><span class="op">(</span></span>
+<span>  method <span class="op">=</span> <span class="fu"><a href="https://rdrr.io/r/base/c.html" class="external-link">c</a></span><span class="op">(</span><span class="st">"MapReduce"</span>, <span class="st">"per-group lm()"</span><span class="op">)</span>,</span>
+<span>  elapsed <span class="op">=</span> <span class="fu"><a href="https://rdrr.io/r/base/c.html" class="external-link">c</a></span><span class="op">(</span><span class="va">map_reduce_lm</span><span class="op">$</span><span class="va">elapsed</span>, <span class="va">raw_lm</span><span class="op">$</span><span class="va">elapsed</span><span class="op">)</span></span>
+<span><span class="op">)</span></span></code></pre></div>
+<p>This is the central reason for the MapReduce route: the R finalizer receives only one compact row of partial statistics per group rather than all original observations.</p>
+<p>The development suite used the closely related regression <strong>slope</strong> calculation with the same sufficient-statistics idea. It took about <strong>2.20 s</strong> with MapReduce versus <strong>6.55 s</strong> for one-worker raw-group materialization with <code><a href="https://rdrr.io/r/stats/lm.html" class="external-link">lm()</a></code>. The exact p-value example above is intentionally more demanding of the R finalizer than the slope-only benchmark.</p>
+</div>
+<div class="section level3">
+<h3 id="experiment-3-a-cheap-custom-r-function-can-become-slower-with-more-workers">Experiment 3: a cheap custom R function can become slower with more workers<a class="anchor" aria-label="anchor" href="#experiment-3-a-cheap-custom-r-function-can-become-slower-with-more-workers"></a>
+</h3>
+<p>This was the lightweight function used in the development benchmark:</p>
+<div class="sourceCode" id="cb19"><pre class="downlit sourceCode r">
+<code class="sourceCode R"><span><span class="va">custom_light</span> <span class="op">&lt;-</span> <span class="kw">function</span><span class="op">(</span><span class="va">x</span>, <span class="va">y</span><span class="op">)</span> <span class="op">{</span></span>
+<span>  <span class="fu"><a href="https://rdrr.io/r/base/mean.html" class="external-link">mean</a></span><span class="op">(</span><span class="op">(</span><span class="va">x</span> <span class="op">-</span> <span class="va">y</span><span class="op">)</span><span class="op">^</span><span class="fl">2</span> <span class="op">+</span> <span class="fu"><a href="https://rdrr.io/r/base/MathFun.html" class="external-link">abs</a></span><span class="op">(</span><span class="va">x</span><span class="op">)</span>, na.rm <span class="op">=</span> <span class="cn">TRUE</span><span class="op">)</span></span>
+<span><span class="op">}</span></span></code></pre></div>
+<p>We can time the same calculation at different worker counts. The helper below also verifies that changing the worker count does not change the result.</p>
+<div class="sourceCode" id="cb20"><pre class="downlit sourceCode r">
+<code class="sourceCode R"><span><span class="va">benchmark_workers</span> <span class="op">&lt;-</span> <span class="kw">function</span><span class="op">(</span><span class="va">fun</span>, <span class="va">strategy</span><span class="op">)</span> <span class="op">{</span></span>
+<span>  <span class="va">workers</span> <span class="op">&lt;-</span> <span class="fu"><a href="https://rdrr.io/r/base/c.html" class="external-link">c</a></span><span class="op">(</span><span class="fl">1L</span>, <span class="fl">2L</span>, <span class="fl">4L</span><span class="op">)</span></span>
+<span></span>
+<span>  <span class="va">runs</span> <span class="op">&lt;-</span> <span class="fu"><a href="https://rdrr.io/r/base/lapply.html" class="external-link">lapply</a></span><span class="op">(</span><span class="va">workers</span>, <span class="kw">function</span><span class="op">(</span><span class="va">w</span><span class="op">)</span> <span class="op">{</span></span>
+<span>    <span class="fu">time_run</span><span class="op">(</span></span>
+<span>      <span class="fu"><a href="reference/summarise_big.html">summarise_big</a></span><span class="op">(</span></span>
+<span>        <span class="va">bench_ds</span>,</span>
+<span>        result <span class="op">=</span> <span class="fu">fun</span><span class="op">(</span><span class="va">x</span>, <span class="va">y</span><span class="op">)</span>,</span>
+<span>        .by <span class="op">=</span> <span class="va">grp</span>,</span>
+<span>        .strategy <span class="op">=</span> <span class="va">strategy</span>,</span>
+<span>        .workers <span class="op">=</span> <span class="va">w</span>,</span>
+<span>        .chunk_rows <span class="op">=</span> <span class="fl">100000</span>,</span>
+<span>        .task_rows <span class="op">=</span> <span class="fl">25000</span>,</span>
+<span>        .try_arrow <span class="op">=</span> <span class="cn">FALSE</span></span>
+<span>      <span class="op">)</span></span>
+<span>    <span class="op">)</span></span>
+<span>  <span class="op">}</span><span class="op">)</span></span>
+<span></span>
+<span>  <span class="va">reference</span> <span class="op">&lt;-</span> <span class="va">runs</span><span class="op">[[</span><span class="fl">1</span><span class="op">]</span><span class="op">]</span><span class="op">$</span><span class="va">value</span></span>
+<span></span>
+<span>  <span class="fu"><a href="https://rdrr.io/r/base/stopifnot.html" class="external-link">stopifnot</a></span><span class="op">(</span></span>
+<span>    <span class="fu"><a href="https://rdrr.io/r/base/all.html" class="external-link">all</a></span><span class="op">(</span><span class="fu"><a href="https://rdrr.io/r/base/lapply.html" class="external-link">vapply</a></span><span class="op">(</span></span>
+<span>      <span class="va">runs</span><span class="op">[</span><span class="op">-</span><span class="fl">1</span><span class="op">]</span>,</span>
+<span>      <span class="kw">function</span><span class="op">(</span><span class="va">run</span><span class="op">)</span> <span class="fu">same_result</span><span class="op">(</span><span class="va">reference</span>, <span class="va">run</span><span class="op">$</span><span class="va">value</span><span class="op">)</span>,</span>
+<span>      <span class="fu"><a href="https://rdrr.io/r/base/logical.html" class="external-link">logical</a></span><span class="op">(</span><span class="fl">1</span><span class="op">)</span></span>
+<span>    <span class="op">)</span><span class="op">)</span></span>
+<span>  <span class="op">)</span></span>
+<span></span>
+<span>  <span class="fu"><a href="https://rdrr.io/r/base/data.frame.html" class="external-link">data.frame</a></span><span class="op">(</span></span>
+<span>    strategy <span class="op">=</span> <span class="va">strategy</span>,</span>
+<span>    workers <span class="op">=</span> <span class="va">workers</span>,</span>
+<span>    elapsed <span class="op">=</span> <span class="fu"><a href="https://rdrr.io/r/base/lapply.html" class="external-link">vapply</a></span><span class="op">(</span><span class="va">runs</span>, <span class="kw">function</span><span class="op">(</span><span class="va">run</span><span class="op">)</span> <span class="va">run</span><span class="op">$</span><span class="va">elapsed</span>, <span class="fu"><a href="https://rdrr.io/r/base/numeric.html" class="external-link">numeric</a></span><span class="op">(</span><span class="fl">1</span><span class="op">)</span><span class="op">)</span></span>
+<span>  <span class="op">)</span></span>
+<span><span class="op">}</span></span>
+<span></span>
+<span><span class="fu">benchmark_workers</span><span class="op">(</span><span class="va">custom_light</span>, <span class="st">"parallel_chunks"</span><span class="op">)</span></span>
+<span></span>
+<span><span class="kw">if</span> <span class="op">(</span><span class="fu"><a href="https://rdrr.io/r/base/ns-load.html" class="external-link">requireNamespace</a></span><span class="op">(</span><span class="st">"mori"</span>, quietly <span class="op">=</span> <span class="cn">TRUE</span><span class="op">)</span><span class="op">)</span> <span class="op">{</span></span>
+<span>  <span class="fu">benchmark_workers</span><span class="op">(</span><span class="va">custom_light</span>, <span class="st">"shared_chunk"</span><span class="op">)</span></span>
+<span><span class="op">}</span></span></code></pre></div>
+<p>On the larger development benchmark, the exact same <code>custom_light()</code> function produced:</p>
 <table class="table">
 <thead><tr>
-<th>Statistic</th>
-<th align="right">MapReduce</th>
-<th align="right">1-worker <code>parallel_chunks</code>
-</th>
+<th>Strategy</th>
+<th align="right">1 worker</th>
+<th align="right">2 workers</th>
+<th align="right">4 workers</th>
 </tr></thead>
 <tbody>
 <tr>
-<td>Skew-style sufficient-statistic calculation</td>
-<td align="right">2.31 s</td>
-<td align="right">4.48 s</td>
+<td><code>parallel_chunks</code></td>
+<td align="right">4.90 s</td>
+<td align="right">6.48 s</td>
+<td align="right">6.49 s</td>
 </tr>
 <tr>
-<td>Regression slope from sufficient statistics</td>
-<td align="right">2.20 s</td>
-<td align="right">6.55 s</td>
+<td><code>shared_chunk</code></td>
+<td align="right">8.45 s</td>
+<td align="right">11.58 s</td>
+<td align="right">11.77 s</td>
 </tr>
 </tbody>
 </table>
-<p>The point is not that MapReduce is always a particular number of times faster. The important distinction is architectural: it transfers a few numbers per group to R instead of transferring the raw observations.</p>
+<p>Nothing is wrong with the parallel machinery here: the useful R work is simply too cheap. Worker startup, future scheduling, Parquet I/O, task construction, serialization, and result combination cost more than the parallelism saves.</p>
 </div>
 <div class="section level3">
-<h3 id="parallelism-helps-expensive-r-work">Parallelism helps expensive R work<a class="anchor" aria-label="anchor" href="#parallelism-helps-expensive-r-work"></a>
+<h3 id="experiment-4-give-the-workers-enough-cpu-work-and-parallelism-can-pay">Experiment 4: give the workers enough CPU work and parallelism can pay<a class="anchor" aria-label="anchor" href="#experiment-4-give-the-workers-enough-cpu-work-and-parallelism-can-pay"></a>
 </h3>
-<p>On a deliberately CPU-heavy 10-million-row workload:</p>
+<p>To test actual CPU scaling, the development suite used this deterministic function:</p>
+<div class="sourceCode" id="cb21"><pre class="downlit sourceCode r">
+<code class="sourceCode R"><span><span class="va">custom_cpu</span> <span class="op">&lt;-</span> <span class="kw">function</span><span class="op">(</span><span class="va">x</span>, <span class="va">y</span>, <span class="va">reps</span> <span class="op">=</span> <span class="fl">25L</span><span class="op">)</span> <span class="op">{</span></span>
+<span>  <span class="va">z</span> <span class="op">&lt;-</span> <span class="va">x</span> <span class="op">-</span> <span class="va">y</span></span>
+<span>  <span class="va">acc</span> <span class="op">&lt;-</span> <span class="fl">0</span></span>
+<span></span>
+<span>  <span class="kw">for</span> <span class="op">(</span><span class="va">k</span> <span class="kw">in</span> <span class="fu"><a href="https://rdrr.io/r/base/seq.html" class="external-link">seq_len</a></span><span class="op">(</span><span class="va">reps</span><span class="op">)</span><span class="op">)</span> <span class="op">{</span></span>
+<span>    <span class="va">a</span> <span class="op">&lt;-</span> <span class="va">k</span> <span class="op">/</span> <span class="op">(</span><span class="va">reps</span> <span class="op">+</span> <span class="fl">1</span><span class="op">)</span></span>
+<span></span>
+<span>    <span class="va">acc</span> <span class="op">&lt;-</span> <span class="va">acc</span> <span class="op">+</span> <span class="fu"><a href="https://rdrr.io/r/base/mean.html" class="external-link">mean</a></span><span class="op">(</span></span>
+<span>      <span class="fu"><a href="https://rdrr.io/r/base/Trig.html" class="external-link">sin</a></span><span class="op">(</span><span class="va">z</span> <span class="op">*</span> <span class="op">(</span><span class="fl">1</span> <span class="op">+</span> <span class="va">a</span><span class="op">)</span><span class="op">)</span><span class="op">^</span><span class="fl">2</span> <span class="op">+</span></span>
+<span>        <span class="fu"><a href="https://rdrr.io/r/base/Trig.html" class="external-link">cos</a></span><span class="op">(</span><span class="op">(</span><span class="va">x</span> <span class="op">+</span> <span class="va">y</span><span class="op">)</span> <span class="op">/</span> <span class="op">(</span><span class="fl">1</span> <span class="op">+</span> <span class="va">a</span><span class="op">)</span><span class="op">)</span><span class="op">^</span><span class="fl">2</span> <span class="op">+</span></span>
+<span>        <span class="fu"><a href="https://rdrr.io/r/base/Log.html" class="external-link">log1p</a></span><span class="op">(</span><span class="fu"><a href="https://rdrr.io/r/base/MathFun.html" class="external-link">abs</a></span><span class="op">(</span><span class="va">z</span> <span class="op">*</span> <span class="va">a</span><span class="op">)</span><span class="op">)</span>,</span>
+<span>      na.rm <span class="op">=</span> <span class="cn">TRUE</span></span>
+<span>    <span class="op">)</span></span>
+<span>  <span class="op">}</span></span>
+<span></span>
+<span>  <span class="va">acc</span> <span class="op">/</span> <span class="va">reps</span></span>
+<span><span class="op">}</span></span></code></pre></div>
+<p>You can run exactly the same worker-count experiment:</p>
+<div class="sourceCode" id="cb22"><pre class="downlit sourceCode r">
+<code class="sourceCode R"><span><span class="va">cpu_reps</span> <span class="op">&lt;-</span> <span class="fl">25L</span></span>
+<span></span>
+<span><span class="va">custom_cpu_benchmark</span> <span class="op">&lt;-</span> <span class="kw">function</span><span class="op">(</span><span class="va">x</span>, <span class="va">y</span><span class="op">)</span> <span class="op">{</span></span>
+<span>  <span class="fu">custom_cpu</span><span class="op">(</span><span class="va">x</span>, <span class="va">y</span>, reps <span class="op">=</span> <span class="va">cpu_reps</span><span class="op">)</span></span>
+<span><span class="op">}</span></span>
+<span></span>
+<span><span class="fu">benchmark_workers</span><span class="op">(</span><span class="va">custom_cpu_benchmark</span>, <span class="st">"parallel_chunks"</span><span class="op">)</span></span>
+<span></span>
+<span><span class="kw">if</span> <span class="op">(</span><span class="fu"><a href="https://rdrr.io/r/base/ns-load.html" class="external-link">requireNamespace</a></span><span class="op">(</span><span class="st">"mori"</span>, quietly <span class="op">=</span> <span class="cn">TRUE</span><span class="op">)</span><span class="op">)</span> <span class="op">{</span></span>
+<span>  <span class="fu">benchmark_workers</span><span class="op">(</span><span class="va">custom_cpu_benchmark</span>, <span class="st">"shared_chunk"</span><span class="op">)</span></span>
+<span><span class="op">}</span></span></code></pre></div>
+<p>If these runs are still too short on your machine, increase <code>cpu_reps</code> rather than assuming that adding workers must help.</p>
+<p>With this exact function and <code>reps = 25</code>, the larger development run produced:</p>
 <table class="table">
 <thead><tr>
 <th>Strategy</th>
@@ -405,13 +635,35 @@ Does arbitrary R need the raw observations?
 </tr>
 </tbody>
 </table>
-<p>Here the R computation was expensive enough that worker parallelism paid for itself. <code>parallel_chunks</code> reached about a <strong>2.15x</strong> speedup at four workers in this run; <code>shared_chunk</code> reached about <strong>1.54x</strong>.</p>
+<p>Here there is enough ordinary-R computation to amortize the parallel overhead. <code>parallel_chunks</code> achieved about a <strong>2.15x</strong> speedup from one to four workers in that run, while <code>shared_chunk</code> achieved about <strong>1.54x</strong>.</p>
+<p>The two strategies optimize different things: <code>parallel_chunks</code> is generally the throughput-oriented choice, while <code>shared_chunk</code> is designed to reduce simultaneous private copies of a materialized chunk.</p>
 </div>
 <div class="section level3">
-<h3 id="cheap-functions-can-get-slower-with-more-workers">Cheap functions can get slower with more workers<a class="anchor" aria-label="anchor" href="#cheap-functions-can-get-slower-with-more-workers"></a>
+<h3 id="experiment-5-even-a-substantial-raw-data-calculation-need-not-scale">Experiment 5: even a substantial raw-data calculation need not scale<a class="anchor" aria-label="anchor" href="#experiment-5-even-a-substantial-raw-data-calculation-need-not-scale"></a>
 </h3>
-<p>For lightweight custom summaries, extra workers did not help. In one benchmark, <code>parallel_chunks</code> took approximately <strong>4.90 s</strong> with one worker and <strong>6.48 s</strong> with two workers. <code>shared_chunk</code> showed the same general effect.</p>
-<p>An exact-quantile workload also failed to benefit from more workers:</p>
+<p>Exact quantiles are a useful counterexample because they require the raw group values and sorting work, but the overall workload can still be dominated by materialization and coordination costs.</p>
+<p>The development benchmark used:</p>
+<div class="sourceCode" id="cb23"><pre class="downlit sourceCode r">
+<code class="sourceCode R"><span><span class="va">custom_quantile</span> <span class="op">&lt;-</span> <span class="kw">function</span><span class="op">(</span><span class="va">x</span>, <span class="va">y</span><span class="op">)</span> <span class="op">{</span></span>
+<span>  <span class="va">z</span> <span class="op">&lt;-</span> <span class="op">(</span><span class="va">x</span> <span class="op">-</span> <span class="va">y</span><span class="op">)</span><span class="op">^</span><span class="fl">2</span> <span class="op">+</span> <span class="fu"><a href="https://rdrr.io/r/base/Trig.html" class="external-link">sin</a></span><span class="op">(</span><span class="va">x</span><span class="op">)</span> <span class="op">+</span> <span class="fu"><a href="https://rdrr.io/r/base/Log.html" class="external-link">log1p</a></span><span class="op">(</span><span class="fu"><a href="https://rdrr.io/r/base/MathFun.html" class="external-link">abs</a></span><span class="op">(</span><span class="va">y</span><span class="op">)</span><span class="op">)</span></span>
+<span></span>
+<span>  <span class="va">qs</span> <span class="op">&lt;-</span> <span class="fu">stats</span><span class="fu">::</span><span class="fu"><a href="https://rdrr.io/r/stats/quantile.html" class="external-link">quantile</a></span><span class="op">(</span></span>
+<span>    <span class="va">z</span>,</span>
+<span>    probs <span class="op">=</span> <span class="fu"><a href="https://rdrr.io/r/base/c.html" class="external-link">c</a></span><span class="op">(</span><span class="fl">0.10</span>, <span class="fl">0.50</span>, <span class="fl">0.90</span>, <span class="fl">0.99</span><span class="op">)</span>,</span>
+<span>    na.rm <span class="op">=</span> <span class="cn">TRUE</span>,</span>
+<span>    names <span class="op">=</span> <span class="cn">FALSE</span>,</span>
+<span>    type <span class="op">=</span> <span class="fl">7</span></span>
+<span>  <span class="op">)</span></span>
+<span></span>
+<span>  <span class="va">qs</span><span class="op">[[</span><span class="fl">4L</span><span class="op">]</span><span class="op">]</span> <span class="op">-</span> <span class="va">qs</span><span class="op">[[</span><span class="fl">1L</span><span class="op">]</span><span class="op">]</span> <span class="op">+</span> <span class="va">qs</span><span class="op">[[</span><span class="fl">3L</span><span class="op">]</span><span class="op">]</span> <span class="op">-</span> <span class="va">qs</span><span class="op">[[</span><span class="fl">2L</span><span class="op">]</span><span class="op">]</span></span>
+<span><span class="op">}</span></span></code></pre></div>
+<div class="sourceCode" id="cb24"><pre class="downlit sourceCode r">
+<code class="sourceCode R"><span><span class="fu">benchmark_workers</span><span class="op">(</span><span class="va">custom_quantile</span>, <span class="st">"parallel_chunks"</span><span class="op">)</span></span>
+<span></span>
+<span><span class="kw">if</span> <span class="op">(</span><span class="fu"><a href="https://rdrr.io/r/base/ns-load.html" class="external-link">requireNamespace</a></span><span class="op">(</span><span class="st">"mori"</span>, quietly <span class="op">=</span> <span class="cn">TRUE</span><span class="op">)</span><span class="op">)</span> <span class="op">{</span></span>
+<span>  <span class="fu">benchmark_workers</span><span class="op">(</span><span class="va">custom_quantile</span>, <span class="st">"shared_chunk"</span><span class="op">)</span></span>
+<span><span class="op">}</span></span></code></pre></div>
+<p>The corresponding development timings were:</p>
 <table class="table">
 <thead><tr>
 <th>Strategy</th>
@@ -434,8 +686,17 @@ Does arbitrary R need the raw observations?
 </tr>
 </tbody>
 </table>
-<p>Parallel execution has real costs: worker startup, scheduling, future creation, Parquet I/O, task construction, serialization, and result combination. If the summary itself is cheap, those costs can dominate.</p>
-<p>So <code>.workers = 2</code> is a conservative default, not a claim that two workers are always faster than one. Benchmark the workload that matters to you.</p>
+<p>So the practical rule is not “use more workers for difficult functions”. It is: <strong>benchmark the actual function, group structure, and storage layout that matter to your analysis.</strong></p>
+<p>Taken together, the experiments support the package’s execution hierarchy:</p>
+<ol style="list-style-type: decimal">
+<li>
+<strong>Native Arrow first</strong> when it can express the complete grouped result.</li>
+<li>
+<strong>MapReduce next</strong> when compact Arrow-computable partial statistics are sufficient and only a small final calculation needs R.</li>
+<li>
+<strong>Raw-group materialization last</strong>, using <code>parallel_chunks</code> or <code>shared_chunk</code> when the statistic genuinely requires the observations themselves.</li>
+</ol>
+<p>Parallelism is an optimization <em>within</em> the third case, not a substitute for avoiding materialization in the first place.</p>
 </div>
 </div>
 <div class="section level2">
@@ -489,7 +750,7 @@ Does arbitrary R need the raw observations?
 <h2 id="documentation-and-development">Documentation and development<a class="anchor" aria-label="anchor" href="#documentation-and-development"></a>
 </h2>
 <p>The package includes a getting-started vignette:</p>
-<div class="sourceCode" id="cb14"><pre class="downlit sourceCode r">
+<div class="sourceCode" id="cb25"><pre class="downlit sourceCode r">
 <code class="sourceCode R"><span><span class="fu"><a href="https://rdrr.io/r/utils/vignette.html" class="external-link">vignette</a></span><span class="op">(</span><span class="st">"summarisebig"</span>, package <span class="op">=</span> <span class="st">"summarisebig"</span><span class="op">)</span></span></code></pre></div>
 <p>The repository also contains the benchmark scripts used during development. Large generated benchmark datasets are not included in the built CRAN source package.</p>
 </div>
